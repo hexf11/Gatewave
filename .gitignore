@@ -1,0 +1,33 @@
+# Gradle / Android 构建产物
+.gradle/
+.kotlin/
+**/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# 本机 SDK 与签名配置
+local.properties
+keystore.properties
+release-signing/
+*.jks
+*.keystore
+*.p12
+
+# 系统与编辑器文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# 测试和临时输出
+artifacts/
+reports/
+tmp/
+*.log

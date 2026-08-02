@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Gatewave</title>
+  <desc id="desc">由圆角网关和流动路径组成的 Gatewave 标志</desc>
+  <rect width="512" height="512" rx="120" fill="#E8F0FE"/>
+  <path
+      d="M154 356V220c0-58 44-102 102-102s102 44 102 102v34"
+      fill="none"
+      stroke="#0B57D0"
+      stroke-width="58"
+      stroke-linecap="round"
+      stroke-linejoin="round"/>
+  <path
+      d="M154 382c57-73 118-112 208-122"
+      fill="none"
+      stroke="#00A6A6"
+      stroke-width="52"
+      stroke-linecap="round"
+      stroke-linejoin="round"/>
+</svg>

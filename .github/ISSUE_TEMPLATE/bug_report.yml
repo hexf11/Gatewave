@@ -1,0 +1,47 @@
+name: 缺陷报告
+description: 报告可稳定复现的问题
+title: "[缺陷] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: 感谢你帮助改进 Gatewave。安全问题请通过私密漏洞报告提交。
+  - type: input
+    id: version
+    attributes:
+      label: Gatewave 版本
+      placeholder: 例如 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: 设备与 Android 版本
+      placeholder: 例如 Pixel 10a / Android 17
+    validations:
+      required: true
+  - type: textarea
+    id: network
+    attributes:
+      label: 网络环境
+      description: 请说明 VPN、Wi-Fi、客户端和端口配置。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为与日志
+    validations:
+      required: true

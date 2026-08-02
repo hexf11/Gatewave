@@ -1,0 +1,91 @@
+name: 签名发布
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建并发布
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v6
+
+      - name: 校验 Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v6
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: 安装 Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36.1" "build-tools;36.1.0"
+
+      - name: 检查签名变量
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          test -n "$SIGNING_KEY"
+          test -n "$KEY_STORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+
+      - name: 写入签名材料
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$RUNNER_TEMP/gatewave-release.p12"
+          cat > keystore.properties <<PROPERTIES
+          storeFile=$RUNNER_TEMP/gatewave-release.p12
+          storePassword=$KEY_STORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          PROPERTIES
+
+      - name: 构建签名 APK 和 AAB
+        run: ./gradlew --no-daemon clean lintRelease testDebugUnitTest assembleRelease bundleRelease
+
+      - name: 验证并整理产物
+        run: |
+          mkdir -p release
+          cp app/build/outputs/apk/release/app-release.apk "release/Gatewave-${GITHUB_REF_NAME}.apk"
+          cp app/build/outputs/bundle/release/app-release.aab "release/Gatewave-${GITHUB_REF_NAME}.aab"
+          BUILD_TOOLS=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "release/Gatewave-${GITHUB_REF_NAME}.apk" | tee release/APK-SIGNATURE.txt
+          LC_ALL=C jarsigner -verify -verbose -certs "release/Gatewave-${GITHUB_REF_NAME}.aab" > release/AAB-SIGNATURE.txt
+          sha256sum release/Gatewave-* release/*-SIGNATURE.txt > release/SHA256SUMS
+
+      - name: 上传工作流产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: gatewave-${{ github.ref_name }}
+          path: release/*
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --verify-tag \
+            --title "Gatewave ${GITHUB_REF_NAME}" \
+            --notes-file "docs/release-notes/${GITHUB_REF_NAME}.md"
