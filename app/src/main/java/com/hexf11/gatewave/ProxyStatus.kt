@@ -65,6 +65,13 @@ internal data class ProxyStatus(
                 putInt("tcpPooledBufferBytes", stats.tcpPooledBufferBytes)
                 putInt("tcpHalfClosedConnections", stats.tcpHalfClosedConnections)
                 putInt("tcpReceiveBufferBytes", stats.tcpReceiveBufferBytes)
+                putLong("tcpBufferedBytes", stats.tcpBufferedBytes)
+                putLong("tcpPeakBufferedBytes", stats.tcpPeakBufferedBytes)
+                putLong("tcpEagerWriteBytes", stats.tcpEagerWriteBytes)
+                putLong("tcpPartialWriteEvents", stats.tcpPartialWriteEvents)
+                putLong("tcpReadyBudgetYields", stats.tcpReadyBudgetYields)
+                putLong("tcpBufferPoolHits", stats.tcpBufferPoolHits)
+                putLong("tcpDirectBufferAllocations", stats.tcpDirectBufferAllocations)
                 putLong("udpFastPathHits", stats.udpFastPathHits)
                 putLong("udpResolutionMisses", stats.udpResolutionMisses)
                 putInt("udpMaxQueueDepth", stats.udpMaxQueueDepth)
@@ -129,6 +136,16 @@ internal data class ProxyStatus(
                     tcpPooledBufferBytes = preferences.getInt("tcpPooledBufferBytes", 0),
                     tcpHalfClosedConnections = preferences.getInt("tcpHalfClosedConnections", 0),
                     tcpReceiveBufferBytes = preferences.getInt("tcpReceiveBufferBytes", 0),
+                    tcpBufferedBytes = preferences.getLong("tcpBufferedBytes", 0),
+                    tcpPeakBufferedBytes = preferences.getLong("tcpPeakBufferedBytes", 0),
+                    tcpEagerWriteBytes = preferences.getLong("tcpEagerWriteBytes", 0),
+                    tcpPartialWriteEvents = preferences.getLong("tcpPartialWriteEvents", 0),
+                    tcpReadyBudgetYields = preferences.getLong("tcpReadyBudgetYields", 0),
+                    tcpBufferPoolHits = preferences.getLong("tcpBufferPoolHits", 0),
+                    tcpDirectBufferAllocations = preferences.getLong(
+                        "tcpDirectBufferAllocations",
+                        0,
+                    ),
                     udpFastPathHits = preferences.getLong("udpFastPathHits", 0),
                     udpResolutionMisses = preferences.getLong("udpResolutionMisses", 0),
                     udpMaxQueueDepth = preferences.getInt("udpMaxQueueDepth", 0),

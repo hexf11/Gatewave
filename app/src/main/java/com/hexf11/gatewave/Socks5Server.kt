@@ -40,11 +40,7 @@ internal class Socks5Server(
     )
     private val tcpRelayPool = TcpRelayPool(
         laneCount = SelectorLaneSizing.relayLanes(mode = performanceMode),
-        initialBufferSize = when (performanceMode) {
-            PerformanceMode.TURBO -> 32 * 1024
-            PerformanceMode.BALANCED -> 16 * 1024
-            PerformanceMode.POWER_SAVE -> 8 * 1024
-        },
+        tuning = TcpRelayTuningPolicy.forMode(performanceMode),
     )
     private val udpRelayPool = UdpRelayPool(
         SelectorLaneSizing.udpLanes(mode = performanceMode),
@@ -291,6 +287,13 @@ internal class Socks5Server(
                 tcpPooledBufferBytes = tcp.pooledBufferBytes,
                 tcpHalfClosedConnections = tcp.halfClosedConnections,
                 tcpReceiveBufferBytes = tcpSocketTuning.receiveBufferBytes,
+                tcpBufferedBytes = tcp.bufferedBytes,
+                tcpPeakBufferedBytes = tcp.peakBufferedBytes,
+                tcpEagerWriteBytes = tcp.eagerWriteBytes,
+                tcpPartialWriteEvents = tcp.partialWriteEvents,
+                tcpReadyBudgetYields = tcp.readyBudgetYields,
+                tcpBufferPoolHits = tcp.bufferPoolHits,
+                tcpDirectBufferAllocations = tcp.directBufferAllocations,
                 udpFastPathHits = udp.fastPathHits,
                 udpResolutionMisses = udp.resolutionMisses,
                 udpMaxQueueDepth = udp.maxQueueDepth,

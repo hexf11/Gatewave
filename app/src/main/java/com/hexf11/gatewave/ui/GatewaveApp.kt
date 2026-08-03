@@ -402,8 +402,8 @@ private fun StatusStrip(state: ProxyUiState) {
         VerticalDivider(Modifier.height(36.dp), color = MaterialTheme.colorScheme.outlineVariant)
         StatusItem(
             icon = Icons.Outlined.Lan,
-            label = "SOCKS5",
-            value = if (state.running) state.activeConnections.toString() else "关闭",
+            label = "活跃客户端",
+            value = if (state.running) state.activeClients.toString() else "关闭",
             healthy = state.running,
             modifier = Modifier.weight(1f),
         )
@@ -720,6 +720,18 @@ private fun LogsScreen(state: ProxyUiState, contentPadding: PaddingValues) {
             )
             CounterRow("TCP 缓冲池", formatBytes(state.tcpPooledBufferBytes.toLong()))
             CounterRow("TCP 上游窗口", formatBytes(state.tcpReceiveBufferBytes.toLong()))
+            CounterRow(
+                "TCP 数据面",
+                "排队 ${formatBytes(state.tcpBufferedBytes)} · 峰值 ${formatBytes(state.tcpPeakBufferedBytes)}",
+            )
+            CounterRow(
+                "TCP 直写",
+                "${formatBytes(state.tcpEagerWriteBytes)} · 背压 ${state.tcpPartialWriteEvents} · 让出 ${state.tcpReadyBudgetYields}",
+            )
+            CounterRow(
+                "直接缓冲复用",
+                "命中 ${state.tcpBufferPoolHits} · 分配 ${state.tcpDirectBufferAllocations}",
+            )
             CounterRow("TCP 半关闭排空", state.tcpHalfClosedConnections.toString())
             CounterRow("实时上传", "${formatBytes(state.uploadBytesPerSecond)}/s")
             CounterRow("实时下载", "${formatBytes(state.downloadBytesPerSecond)}/s")

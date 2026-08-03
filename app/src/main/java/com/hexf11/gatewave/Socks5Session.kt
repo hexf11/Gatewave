@@ -384,10 +384,12 @@ internal class Socks5Session(
         clientKey.cancel()
         remoteKey?.cancel()
         lane?.detach(this)
+        val prefetchedClientData = takeBufferedClientData()
         try {
             tcpRelayPool.register(
                 client = client,
                 remote = remote,
+                initialClientData = prefetchedClientData,
                 trafficListener = TcpRelayPool.TrafficListener(listener::onTraffic),
                 closeListener = TcpRelayPool.CloseListener { relayFailed ->
                     if (relayFailed) failed = true
@@ -396,6 +398,16 @@ internal class Socks5Session(
             )
         } catch (error: Exception) {
             abort("Unable to hand off TCP relay", error)
+        }
+    }
+
+    /** Preserves bytes pipelined behind the SOCKS request instead of dropping the first payload. */
+    private fun takeBufferedClientData(): ByteArray {
+        if (input.position() == 0) return EMPTY_CLIENT_DATA
+        input.flip()
+        return ByteArray(input.remaining()).also {
+            input.get(it)
+            input.clear()
         }
     }
 
@@ -556,6 +568,7 @@ internal class Socks5Session(
 
     companion object {
         private const val TAG = "GatewaveSession"
+        private val EMPTY_CLIENT_DATA = ByteArray(0)
         private const val SOCKS_VERSION = 0x05
         private const val METHOD_NO_AUTH = 0x00
         private const val COMMAND_CONNECT = 0x01

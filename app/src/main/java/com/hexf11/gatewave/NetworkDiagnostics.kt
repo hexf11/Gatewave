@@ -435,8 +435,9 @@ internal object NetworkDiagnostics {
                 "峰值 ${stats.peakConnections} · 活跃设备 ${stats.activeClients}",
         )
         appendLine(
-                "数据面: TCP Selector ${stats.tcpSelectorLanes} · UDP Selector ${stats.udpSelectorLanes} · " +
-                "TCP 缓冲池 ${stats.tcpPooledBufferBytes} bytes · 半关闭 ${stats.tcpHalfClosedConnections}",
+            "数据面: TCP Selector ${stats.tcpSelectorLanes} · UDP Selector ${stats.udpSelectorLanes} · " +
+                "TCP 缓冲池 ${stats.tcpPooledBufferBytes} bytes · 排队 ${stats.tcpBufferedBytes} bytes · " +
+                "峰值 ${stats.tcpPeakBufferedBytes} bytes · 半关闭 ${stats.tcpHalfClosedConnections}",
         )
         appendLine(
             "DNS: 缓存 ${stats.dnsCacheEntries} · 命中 ${stats.dnsCacheHits} · " +
@@ -448,6 +449,9 @@ internal object NetworkDiagnostics {
         )
         appendLine(
             "调优: TCP 上游窗口 ${stats.tcpReceiveBufferBytes} bytes · " +
+                "直写 ${stats.tcpEagerWriteBytes} bytes · 背压 ${stats.tcpPartialWriteEvents} · " +
+                "让出 ${stats.tcpReadyBudgetYields} · 缓冲复用 ${stats.tcpBufferPoolHits} / " +
+                "分配 ${stats.tcpDirectBufferAllocations} · " +
                 "UDP 快路径 ${stats.udpFastPathHits} · 解析 ${stats.udpResolutionMisses} · " +
                 "队列峰值 ${stats.udpMaxQueueDepth}",
         )
