@@ -22,11 +22,17 @@ internal class UdpRelayPool(
     private val nextLane = AtomicInteger()
     private val activeAssociations = AtomicInteger()
     private val droppedDatagrams = AtomicLong()
+    private val fastPathHits = AtomicLong()
+    private val resolutionMisses = AtomicLong()
+    private val maxQueueDepth = AtomicInteger()
     private val lanes = List(laneCount.coerceAtLeast(1)) {
         Lane(
             "proxy-udp-${it + 1}",
             activeDelta = activeAssociations::addAndGet,
             dropCounter = droppedDatagrams::incrementAndGet,
+            fastPathCounter = fastPathHits::incrementAndGet,
+            resolutionCounter = resolutionMisses::incrementAndGet,
+            queueDepthObserver = { depth -> maxQueueDepth.accumulateAndGet(depth, ::maxOf) },
         )
     }
 
@@ -40,9 +46,23 @@ internal class UdpRelayPool(
         return lanes[index]
     }
 
-    data class Stats(val activeAssociations: Int, val droppedDatagrams: Long, val lanes: Int)
+    data class Stats(
+        val activeAssociations: Int,
+        val droppedDatagrams: Long,
+        val lanes: Int,
+        val fastPathHits: Long,
+        val resolutionMisses: Long,
+        val maxQueueDepth: Int,
+    )
 
-    fun stats(): Stats = Stats(activeAssociations.get(), droppedDatagrams.get(), lanes.size)
+    fun stats(): Stats = Stats(
+        activeAssociations = activeAssociations.get(),
+        droppedDatagrams = droppedDatagrams.get(),
+        lanes = lanes.size,
+        fastPathHits = fastPathHits.get(),
+        resolutionMisses = resolutionMisses.get(),
+        maxQueueDepth = maxQueueDepth.get(),
+    )
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
@@ -53,6 +73,9 @@ internal class UdpRelayPool(
         threadName: String,
         private val activeDelta: (Int) -> Int,
         private val dropCounter: () -> Long,
+        private val fastPathCounter: () -> Long,
+        private val resolutionCounter: () -> Long,
+        private val queueDepthObserver: (Int) -> Unit,
     ) : Closeable {
         private val selector = Selector.open()
         private val running = AtomicBoolean(true)
@@ -91,6 +114,18 @@ internal class UdpRelayPool(
 
         fun recordDrop() {
             dropCounter()
+        }
+
+        fun recordFastPath() {
+            fastPathCounter()
+        }
+
+        fun recordResolutionMiss() {
+            resolutionCounter()
+        }
+
+        fun observeQueueDepth(depth: Int) {
+            queueDepthObserver(depth)
         }
 
         private fun runLoop() {

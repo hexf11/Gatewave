@@ -64,6 +64,10 @@ internal data class ProxyStatus(
                 putInt("udpSelectorLanes", stats.udpSelectorLanes)
                 putInt("tcpPooledBufferBytes", stats.tcpPooledBufferBytes)
                 putInt("tcpHalfClosedConnections", stats.tcpHalfClosedConnections)
+                putInt("tcpReceiveBufferBytes", stats.tcpReceiveBufferBytes)
+                putLong("udpFastPathHits", stats.udpFastPathHits)
+                putLong("udpResolutionMisses", stats.udpResolutionMisses)
+                putInt("udpMaxQueueDepth", stats.udpMaxQueueDepth)
                 putBoolean("subscriptionEnabled", subscriptionEnabled)
                 putString("subscriptionUrl", subscriptionUrl)
                 putString("message", message)
@@ -124,6 +128,10 @@ internal data class ProxyStatus(
                     udpSelectorLanes = preferences.getInt("udpSelectorLanes", 0),
                     tcpPooledBufferBytes = preferences.getInt("tcpPooledBufferBytes", 0),
                     tcpHalfClosedConnections = preferences.getInt("tcpHalfClosedConnections", 0),
+                    tcpReceiveBufferBytes = preferences.getInt("tcpReceiveBufferBytes", 0),
+                    udpFastPathHits = preferences.getLong("udpFastPathHits", 0),
+                    udpResolutionMisses = preferences.getLong("udpResolutionMisses", 0),
+                    udpMaxQueueDepth = preferences.getInt("udpMaxQueueDepth", 0),
                 ),
                 subscriptionEnabled = preferences.getBoolean("subscriptionEnabled", false),
                 subscriptionUrl = preferences.getString("subscriptionUrl", "--") ?: "--",

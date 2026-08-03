@@ -3,8 +3,6 @@ package com.hexf11.gatewave
 import android.net.Network
 import android.util.Log
 import java.io.IOException
-import java.net.Inet4Address
-import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.StandardSocketOptions
@@ -12,7 +10,6 @@ import java.nio.ByteBuffer
 import java.nio.channels.DatagramChannel
 import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
-import java.nio.charset.StandardCharsets
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -36,13 +33,14 @@ internal class UdpRelay @Throws(IOException::class) constructor(
     }
 
     private data class Outgoing(
-        val bytes: ByteArray,
+        val buffer: ByteBuffer,
         val target: InetSocketAddress,
         val trafficBytes: Int,
     )
 
     private val closed = AtomicBoolean(false)
     private val allowedRemotes = HashSet<InetSocketAddress>()
+    private val destinationCache = UdpDestinationCache(MAX_REMOTE_ENDPOINTS)
     private val toClient = ArrayDeque<Outgoing>()
     private val toUpstream = ArrayDeque<Outgoing>()
     private val clientChannel = DatagramChannel.open()
@@ -114,13 +112,15 @@ internal class UdpRelay @Throws(IOException::class) constructor(
             val length = buffer.position()
             if (length == 0) return@repeat
             buffer.flip()
-            val bytes = ByteArray(length)
-            buffer.get(bytes)
-            if (clientSide) receiveFromClient(source, bytes) else receiveFromRemote(source, bytes)
+            if (clientSide) {
+                receiveFromClient(source, buffer, length)
+            } else {
+                receiveFromRemote(source, buffer, length)
+            }
         }
     }
 
-    private fun receiveFromClient(source: InetSocketAddress, bytes: ByteArray) {
+    private fun receiveFromClient(source: InetSocketAddress, buffer: ByteBuffer, length: Int) {
         if (source.address != expectedClientAddress) return
         val current = clientEndpoint
         if (current == null) {
@@ -130,12 +130,31 @@ internal class UdpRelay @Throws(IOException::class) constructor(
         }
 
         val request = try {
-            SocksUdpDatagram.decode(bytes, bytes.size)
+            SocksUdpCodec.decode(buffer, length)
         } catch (error: Exception) {
             lane.recordDrop()
             Log.d(TAG, "Dropped malformed UDP request: ${error.message}")
             return
         }
+        destinationCache.get(request.host, request.port)?.let { remote ->
+            lane.recordFastPath()
+            enqueueUpstream(request, remote)
+            return
+        }
+        NumericAddressParser.parse(request.host)?.let { address ->
+            if (NetworkUtils.isBlockedTarget(address)) {
+                lane.recordDrop()
+                return
+            }
+            val remote = InetSocketAddress(address, request.port)
+            if (allow(remote)) {
+                destinationCache.put(request.host, request.port, remote)
+                lane.recordFastPath()
+                enqueueUpstream(request, remote)
+            }
+            return
+        }
+        lane.recordResolutionMiss()
         dnsResolver.resolve(vpnNetwork, request.host) { result ->
             lane.execute {
                 if (closed.get()) return@execute
@@ -145,21 +164,37 @@ internal class UdpRelay @Throws(IOException::class) constructor(
                         return@execute
                     }
                 val remote = InetSocketAddress(address, request.port)
-                if (remote !in allowedRemotes && allowedRemotes.size >= MAX_REMOTE_ENDPOINTS) {
-                    lane.recordDrop()
-                    return@execute
+                if (allow(remote)) {
+                    destinationCache.put(request.host, request.port, remote)
+                    enqueueUpstream(request, remote)
                 }
-                allowedRemotes.add(remote)
-                enqueue(
-                    queue = toUpstream,
-                    outgoing = Outgoing(request.payload, remote, request.payload.size),
-                    key = upstreamKey,
-                )
             }
         }
     }
 
-    private fun receiveFromRemote(source: InetSocketAddress, payload: ByteArray) {
+    private fun allow(remote: InetSocketAddress): Boolean {
+        if (remote in allowedRemotes) return true
+        if (allowedRemotes.size >= MAX_REMOTE_ENDPOINTS) {
+            lane.recordDrop()
+            return false
+        }
+        allowedRemotes.add(remote)
+        return true
+    }
+
+    private fun enqueueUpstream(request: SocksUdpRequest, remote: InetSocketAddress) {
+        enqueue(
+            queue = toUpstream,
+            outgoing = Outgoing(ByteBuffer.wrap(request.payload), remote, request.payload.size),
+            key = upstreamKey,
+        )
+    }
+
+    private fun receiveFromRemote(
+        source: InetSocketAddress,
+        payload: ByteBuffer,
+        payloadLength: Int,
+    ) {
         if (source !in allowedRemotes) {
             lane.recordDrop()
             return
@@ -168,12 +203,12 @@ internal class UdpRelay @Throws(IOException::class) constructor(
             lane.recordDrop()
             return
         }
-        val response = SocksUdpDatagram.encode(source.address, source.port, payload, payload.size)
+        val response = SocksUdpCodec.encode(source.address, source.port, payload, payloadLength)
         if (response.size > MAX_DATAGRAM_SIZE) {
             lane.recordDrop()
             return
         }
-        enqueue(toClient, Outgoing(response, client, payload.size), clientKey)
+        enqueue(toClient, Outgoing(ByteBuffer.wrap(response), client, payloadLength), clientKey)
     }
 
     private fun enqueue(
@@ -186,6 +221,7 @@ internal class UdpRelay @Throws(IOException::class) constructor(
             return
         }
         queue.addLast(outgoing)
+        lane.observeQueueDepth(queue.size)
         if (key.isValid) key.interestOps(key.interestOps() or SelectionKey.OP_WRITE)
         flush(key.attachment().let { (it as UdpRelayPool.Endpoint).clientSide })
     }
@@ -196,7 +232,7 @@ internal class UdpRelay @Throws(IOException::class) constructor(
         val key = if (clientSide) clientKey else upstreamKey
         repeat(MAX_IO_BATCH) {
             val outgoing = queue.firstOrNull() ?: return@repeat
-            val sent = channel.send(ByteBuffer.wrap(outgoing.bytes), outgoing.target)
+            val sent = channel.send(outgoing.buffer, outgoing.target)
             if (sent == 0) return
             queue.removeFirst()
             lastActivityNanos = System.nanoTime()
@@ -242,85 +278,9 @@ internal class UdpRelay @Throws(IOException::class) constructor(
         toClient.clear()
         toUpstream.clear()
         allowedRemotes.clear()
+        destinationCache.clear()
         lane.remove(this)
         return true
-    }
-
-    private data class SocksUdpDatagram(
-        val host: String,
-        val port: Int,
-        val payload: ByteArray,
-    ) {
-        companion object {
-            fun decode(data: ByteArray, length: Int): SocksUdpDatagram {
-                if (length < 7) throw IOException("UDP datagram too short")
-                var offset = 0
-                if (unsigned(data[offset++]) != 0 || unsigned(data[offset++]) != 0) {
-                    throw IOException("Invalid RSV field")
-                }
-                if (unsigned(data[offset++]) != 0) throw IOException("UDP fragmentation unsupported")
-                val addressType = unsigned(data[offset++])
-                val host = when (addressType) {
-                    0x01 -> {
-                        requireBytes(length, offset, 6)
-                        InetAddress.getByAddress(data.copyOfRange(offset, offset + 4))
-                            .hostAddress.orEmpty().also { offset += 4 }
-                    }
-                    0x03 -> {
-                        requireBytes(length, offset, 1)
-                        val domainLength = unsigned(data[offset++])
-                        if (domainLength == 0) throw IOException("Empty UDP domain")
-                        requireBytes(length, offset, domainLength + 2)
-                        String(data, offset, domainLength, StandardCharsets.US_ASCII)
-                            .also { offset += domainLength }
-                    }
-                    0x04 -> {
-                        requireBytes(length, offset, 18)
-                        InetAddress.getByAddress(data.copyOfRange(offset, offset + 16))
-                            .hostAddress.orEmpty().also { offset += 16 }
-                    }
-                    else -> throw IOException("Unsupported UDP address type $addressType")
-                }
-                requireBytes(length, offset, 2)
-                val port = (unsigned(data[offset++]) shl 8) or unsigned(data[offset++])
-                if (port == 0) throw IOException("Invalid UDP destination port")
-                return SocksUdpDatagram(host, port, data.copyOfRange(offset, length))
-            }
-
-            fun encode(
-                address: InetAddress,
-                port: Int,
-                payload: ByteArray,
-                payloadLength: Int,
-            ): ByteArray {
-                val raw = address.address
-                val addressType = when (address) {
-                    is Inet4Address -> 0x01
-                    is Inet6Address -> 0x04
-                    else -> throw IOException("Unsupported reply address")
-                }
-                val result = ByteArray(4 + raw.size + 2 + payloadLength)
-                var offset = 0
-                result[offset++] = 0
-                result[offset++] = 0
-                result[offset++] = 0
-                result[offset++] = addressType.toByte()
-                raw.copyInto(result, offset)
-                offset += raw.size
-                result[offset++] = ((port ushr 8) and 0xFF).toByte()
-                result[offset++] = (port and 0xFF).toByte()
-                payload.copyInto(result, offset, endIndex = payloadLength)
-                return result
-            }
-
-            private fun unsigned(value: Byte): Int = value.toInt() and 0xFF
-
-            private fun requireBytes(length: Int, offset: Int, needed: Int) {
-                if (offset < 0 || needed < 0 || offset + needed > length) {
-                    throw IOException("Truncated UDP datagram")
-                }
-            }
-        }
     }
 
     companion object {

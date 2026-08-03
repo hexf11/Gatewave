@@ -23,6 +23,7 @@ internal class Socks5Session(
     private val networkProvider: NetworkProvider,
     private val listener: Listener,
     private val tcpRelayPool: TcpRelayPool,
+    private val tcpSocketTuning: TcpSocketTuning,
     private val dnsResolver: VpnDnsResolver,
     private val udpRelayPool: UdpRelayPool,
     private val udpSlots: Semaphore,
@@ -309,8 +310,7 @@ internal class Socks5Session(
                 channel.configureBlocking(false)
                 val socket = channel.socket()
                 vpn.bindSocket(socket)
-                socket.tcpNoDelay = true
-                socket.keepAlive = true
+                tcpSocketTuning.applyToRemote(socket)
                 val attempt = ConnectAttempt(channel, address)
                 connectAttempts += attempt
                 if (channel.connect(InetSocketAddress(address, requestPort))) {

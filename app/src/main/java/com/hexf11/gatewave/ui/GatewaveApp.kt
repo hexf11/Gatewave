@@ -719,10 +719,15 @@ private fun LogsScreen(state: ProxyUiState, contentPadding: PaddingValues) {
                 "${state.dnsCacheEntries} 条 · 命中 ${state.dnsCacheHits} · 查询 ${state.dnsCacheMisses} · 合并 ${state.dnsCoalesced}",
             )
             CounterRow("TCP 缓冲池", formatBytes(state.tcpPooledBufferBytes.toLong()))
+            CounterRow("TCP 上游窗口", formatBytes(state.tcpReceiveBufferBytes.toLong()))
             CounterRow("TCP 半关闭排空", state.tcpHalfClosedConnections.toString())
             CounterRow("实时上传", "${formatBytes(state.uploadBytesPerSecond)}/s")
             CounterRow("实时下载", "${formatBytes(state.downloadBytesPerSecond)}/s")
             CounterRow("UDP 丢弃", state.udpDropped.toString())
+            CounterRow(
+                "UDP 快路径",
+                "命中 ${state.udpFastPathHits} · 解析 ${state.udpResolutionMisses} · 队列峰值 ${state.udpMaxQueueDepth}",
+            )
             CounterRow("公平回收", state.fairnessReclaims.toString())
             CounterRow("上传流量", formatBytes(state.uploadBytes))
             CounterRow("下载流量", formatBytes(state.downloadBytes))
@@ -967,7 +972,7 @@ private fun SettingsScreen(
                 icon = Icons.Outlined.NetworkCheck,
                 title = "网络自检",
                 value = when {
-                    state.diagnostics.running -> "正在检查 VPN、TCP、UDP 与订阅"
+                    state.diagnostics.running -> "正在检查 VPN、TCP、UDP、路径质量与订阅"
                     state.diagnostics.report == null -> "检查完整代理链路并生成诊断报告"
                     state.diagnostics.report.passed -> {
                         "上次检查通过 · 提醒 ${state.diagnostics.report.warningCount} 项"
@@ -1046,7 +1051,7 @@ private fun DiagnosticsDialog(
                         Column {
                             Text("正在检查完整代理链路", style = MaterialTheme.typography.titleMedium)
                             Text(
-                                "VPN 出口和 UDP DNS 可能需要几秒钟",
+                                "将测量 VPN RTT、单流与 4 流吞吐，通常需要 10–30 秒",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1054,7 +1059,7 @@ private fun DiagnosticsDialog(
                     }
                 } else if (report == null) {
                     Text(
-                        "准备检查 Android 兼容性、LAN、系统 VPN、SOCKS5 TCP/UDP、订阅配置和出口 IP。",
+                        "准备检查 Android 兼容性、LAN、系统 VPN、SOCKS5 TCP/UDP、路径质量、订阅配置和出口 IP。",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                 } else {

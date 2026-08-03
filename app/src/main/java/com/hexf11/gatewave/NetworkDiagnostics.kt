@@ -112,6 +112,7 @@ internal object NetworkDiagnostics {
                 "performance",
                 "性能数据面",
                 "${performanceLabel(settings.performanceMode)} · 容量 ${status.stats.maxSessions} · " +
+                    "上游窗口 ${status.stats.tcpReceiveBufferBytes / 1024 / 1024} MiB · " +
                     "TCP Selector ${status.stats.tcpSelectorLanes} · " +
                     "UDP Selector ${status.stats.udpSelectorLanes}",
             )
@@ -144,6 +145,28 @@ internal object NetworkDiagnostics {
                 require(status.running) { "代理服务未启动" }
                 require(vpnReady) { "系统 VPN 未就绪" }
                 probeSocksUdp(settings.socksPort)
+            }
+        }
+
+        checks += if (!status.running || !vpnReady) {
+            warning("path_quality", "VPN 路径质量", "等待代理服务与系统 VPN 就绪")
+        } else {
+            try {
+                val assessment = PathQualityAssessment.assess(
+                    PathQualityProbe.run(checkNotNull(activeNetwork), settings.socksPort),
+                )
+                DiagnosticCheck(
+                    id = "path_quality",
+                    title = "VPN 路径质量",
+                    detail = assessment.detail,
+                    level = assessment.level,
+                )
+            } catch (error: Exception) {
+                warning(
+                    "path_quality",
+                    "VPN 路径质量",
+                    "探测未完成：${error.message ?: error.javaClass.simpleName}",
+                )
             }
         }
 
@@ -229,7 +252,6 @@ internal object NetworkDiagnostics {
             val relayAddress = if (reply.address.isAnyLocalAddress) IPV4_LOOPBACK else reply.address
 
             DatagramSocket(InetSocketAddress(IPV4_LOOPBACK, 0)).use { udp ->
-                udp.soTimeout = UDP_TIMEOUT_MS
                 val query = dnsQuery()
                 val request = ByteArrayOutputStream().also { bytes ->
                     DataOutputStream(bytes).use { data ->
@@ -239,25 +261,34 @@ internal object NetworkDiagnostics {
                         data.write(query)
                     }
                 }.toByteArray()
-                udp.send(
-                    DatagramPacket(
-                        request,
-                        request.size,
-                        InetSocketAddress(relayAddress, reply.port),
-                    ),
-                )
-                val buffer = ByteArray(4096)
-                val packet = DatagramPacket(buffer, buffer.size)
-                udp.receive(packet)
-                val payloadOffset = socksUdpPayloadOffset(buffer, packet.length)
-                require(packet.length - payloadOffset >= 12) { "DNS 响应过短" }
-                val id = unsignedShort(buffer, payloadOffset)
-                val flags = unsignedShort(buffer, payloadOffset + 2)
-                val answers = unsignedShort(buffer, payloadOffset + 6)
-                require(id == DNS_QUERY_ID) { "DNS 事务 ID 不匹配" }
-                require(flags and 0x000F == 0) { "DNS RCODE=${flags and 0x000F}" }
-                require(answers > 0) { "DNS 无应答记录" }
-                return "UDP ASSOCIATE + DNS example.com 成功（$answers 条应答）"
+                var lastError: Exception? = null
+                repeat(UDP_PROBE_ATTEMPTS) {
+                    try {
+                        udp.soTimeout = UDP_ATTEMPT_TIMEOUT_MS
+                        udp.send(
+                            DatagramPacket(
+                                request,
+                                request.size,
+                                InetSocketAddress(relayAddress, reply.port),
+                            ),
+                        )
+                        val buffer = ByteArray(4096)
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        udp.receive(packet)
+                        val payloadOffset = socksUdpPayloadOffset(buffer, packet.length)
+                        require(packet.length - payloadOffset >= 12) { "DNS 响应过短" }
+                        val id = unsignedShort(buffer, payloadOffset)
+                        val flags = unsignedShort(buffer, payloadOffset + 2)
+                        val answers = unsignedShort(buffer, payloadOffset + 6)
+                        require(id == DNS_QUERY_ID) { "DNS 事务 ID 不匹配" }
+                        require(flags and 0x000F == 0) { "DNS RCODE=${flags and 0x000F}" }
+                        require(answers > 0) { "DNS 无应答记录" }
+                        return "UDP ASSOCIATE + DNS example.com 成功（第 ${it + 1} 次 · $answers 条应答）"
+                    } catch (error: Exception) {
+                        lastError = error
+                    }
+                }
+                throw lastError ?: java.net.SocketTimeoutException("UDP DNS 探测超时")
             }
         }
     }
@@ -415,6 +446,11 @@ internal object NetworkDiagnostics {
             "建连: P50 ${stats.connectP50Ms}ms · P95 ${stats.connectP95Ms}ms · " +
                 "UDP 丢弃 ${stats.udpDropped} · 公平回收 ${stats.fairnessReclaims}",
         )
+        appendLine(
+            "调优: TCP 上游窗口 ${stats.tcpReceiveBufferBytes} bytes · " +
+                "UDP 快路径 ${stats.udpFastPathHits} · 解析 ${stats.udpResolutionMisses} · " +
+                "队列峰值 ${stats.udpMaxQueueDepth}",
+        )
         appendLine()
         checks.forEach { check ->
             val anonymousDetail = when (check.id) {
@@ -446,9 +482,10 @@ internal object NetworkDiagnostics {
 
     private val IPV4_LOOPBACK: InetAddress = InetAddress.getByName("127.0.0.1")
     private const val SOCKET_TIMEOUT_MS = 7_000
-    private const val UDP_TIMEOUT_MS = 8_000
+    private const val UDP_ATTEMPT_TIMEOUT_MS = 3_000
+    private const val UDP_PROBE_ATTEMPTS = 3
     private const val MAX_HTTP_BYTES = 128 * 1024
     private const val DNS_QUERY_ID = 0x5058
-    private const val DNS_SERVER = "8.8.4.4"
+    private const val DNS_SERVER = "8.8.8.8"
     private const val EXIT_IP_URL = "https://api.ipify.org"
 }

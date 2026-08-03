@@ -28,6 +28,7 @@ internal class Socks5Server(
     }
 
     private val capacity = ProxyCapacityPolicy.detect(performanceMode)
+    private val tcpSocketTuning = TcpSocketTuningPolicy.forMode(performanceMode)
     private val sessions = ConcurrentHashMap.newKeySet<Socks5Session>()
     private val clientSessions = ConcurrentHashMap<InetAddress, MutableSet<Socks5Session>>()
     private val acceptExecutor: ExecutorService =
@@ -113,6 +114,7 @@ internal class Socks5Server(
                     networkProvider = networkProvider,
                     listener = this,
                     tcpRelayPool = tcpRelayPool,
+                    tcpSocketTuning = tcpSocketTuning,
                     dnsResolver = dnsResolver,
                     udpRelayPool = udpRelayPool,
                     udpSlots = udpSlots,
@@ -288,6 +290,10 @@ internal class Socks5Server(
                 udpSelectorLanes = udp.lanes,
                 tcpPooledBufferBytes = tcp.pooledBufferBytes,
                 tcpHalfClosedConnections = tcp.halfClosedConnections,
+                tcpReceiveBufferBytes = tcpSocketTuning.receiveBufferBytes,
+                udpFastPathHits = udp.fastPathHits,
+                udpResolutionMisses = udp.resolutionMisses,
+                udpMaxQueueDepth = udp.maxQueueDepth,
             ),
         )
     }

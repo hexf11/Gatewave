@@ -59,7 +59,7 @@ internal class VpnDnsResolver : Closeable {
             return
         }
 
-        parseNumericAddress(host)?.let {
+        NumericAddressParser.parse(host)?.let {
             callback.onResult(Result(listOf(it)))
             return
         }
@@ -223,24 +223,6 @@ internal class VpnDnsResolver : Closeable {
         val result = Result(emptyList(), IllegalStateException("DNS resolver stopped"))
         callbacks.forEach { runCatching { it.onResult(result) } }
         executor.shutdownNow()
-    }
-
-    private fun parseNumericAddress(host: String): InetAddress? {
-        val ipv4 = host.split('.')
-        if (ipv4.size == 4) {
-            val raw = ByteArray(4)
-            for (index in raw.indices) {
-                val part = ipv4[index]
-                if (part.isEmpty() || part.length > 3 || part.any { !it.isDigit() }) return null
-                val value = part.toIntOrNull() ?: return null
-                if (value !in 0..255) return null
-                raw[index] = value.toByte()
-            }
-            return runCatching { InetAddress.getByAddress(raw) }.getOrNull()
-        }
-        // A colon cannot occur in a DNS hostname. The platform parser therefore cannot leak this
-        // path to a DNS resolver, while still handling compressed IPv6 literals correctly.
-        return if (':' in host) runCatching { InetAddress.getByName(host) }.getOrNull() else null
     }
 
     companion object {

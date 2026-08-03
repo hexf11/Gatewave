@@ -29,6 +29,10 @@ internal data class ProxyStats(
     @JvmField val udpSelectorLanes: Int = 0,
     @JvmField val tcpPooledBufferBytes: Int = 0,
     @JvmField val tcpHalfClosedConnections: Int = 0,
+    @JvmField val tcpReceiveBufferBytes: Int = 0,
+    @JvmField val udpFastPathHits: Long = 0,
+    @JvmField val udpResolutionMisses: Long = 0,
+    @JvmField val udpMaxQueueDepth: Int = 0,
 ) {
     fun sameAs(other: ProxyStats?): Boolean = this == other
 
