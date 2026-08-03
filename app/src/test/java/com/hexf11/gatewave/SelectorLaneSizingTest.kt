@@ -17,4 +17,13 @@ class SelectorLaneSizingTest {
         assertEquals(1, SelectorLaneSizing.handshakeLanes(4))
         assertEquals(2, SelectorLaneSizing.handshakeLanes(8))
     }
+
+    @Test
+    fun `极速和省电模式覆盖默认 lane 策略`() {
+        assertEquals(4, SelectorLaneSizing.relayLanes(2, PerformanceMode.TURBO))
+        assertEquals(1, SelectorLaneSizing.relayLanes(16, PerformanceMode.POWER_SAVE))
+        assertEquals(1, SelectorLaneSizing.handshakeLanes(16, PerformanceMode.POWER_SAVE))
+        assertEquals(1, SelectorLaneSizing.udpLanes(16, PerformanceMode.POWER_SAVE))
+        assertEquals(2, SelectorLaneSizing.udpLanes(8, PerformanceMode.TURBO))
+    }
 }

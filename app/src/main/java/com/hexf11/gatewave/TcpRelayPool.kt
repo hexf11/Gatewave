@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicInteger
  */
 internal class TcpRelayPool(
     laneCount: Int = SelectorLaneSizing.relayLanes(),
+    private val initialBufferSize: Int = DEFAULT_INITIAL_BUFFER_SIZE,
 ) : Closeable {
     fun interface CloseListener {
         fun onClosed(failed: Boolean)
@@ -33,7 +34,7 @@ internal class TcpRelayPool(
     private val closed = AtomicBoolean(false)
     private val nextLane = AtomicInteger()
     private val lanes = List(laneCount.coerceAtLeast(1)) { index ->
-        RelayLane("proxy-tcp-${index + 1}")
+        RelayLane("proxy-tcp-${index + 1}", initialBufferSize)
     }
 
     init {
@@ -57,12 +58,36 @@ internal class TcpRelayPool(
         lanes.forEach(RelayLane::close)
     }
 
-    private class RelayLane(threadName: String) : Closeable {
+    fun trimMemory() {
+        lanes.forEach(RelayLane::trimMemory)
+    }
+
+    data class Stats(
+        val connections: Int,
+        val halfClosedConnections: Int,
+        val lanes: Int,
+        val pooledBufferBytes: Int,
+    )
+
+    fun stats(): Stats = Stats(
+        connections = lanes.sumOf(RelayLane::connectionCount),
+        halfClosedConnections = lanes.sumOf(RelayLane::halfClosedConnectionCount),
+        lanes = lanes.size,
+        pooledBufferBytes = lanes.sumOf(RelayLane::pooledBufferBytes),
+    )
+
+    private class RelayLane(threadName: String, private val initialBufferSize: Int) : Closeable {
         private val selector = Selector.open()
         private val running = AtomicBoolean(true)
         private val pending = ConcurrentLinkedQueue<Registration>()
+        private val maintenance = ConcurrentLinkedQueue<() -> Unit>()
         private val connections = ConcurrentHashMap.newKeySet<Connection>()
+        private val halfClosedConnections = AtomicInteger()
         private val buffers = DirectBufferPool()
+        private val idleWheel = IdleTimeoutWheel<Connection>(
+            tickNanos = IDLE_TICK_NANOS,
+            wheelSize = IDLE_WHEEL_SIZE,
+        )
         private val thread = Thread(::runLoop, threadName).apply {
             isDaemon = true
             start()
@@ -83,6 +108,7 @@ internal class TcpRelayPool(
         private fun runLoop() {
             try {
                 while (running.get()) {
+                    drainMaintenance()
                     drainRegistrations()
                     selector.select(SELECT_TIMEOUT_MS)
                     val iterator = selector.selectedKeys().iterator()
@@ -92,7 +118,7 @@ internal class TcpRelayPool(
                         val endpoint = key.attachment() as? Endpoint ?: continue
                         endpoint.connection.handle(key, endpoint.clientSide)
                     }
-                    closeIdleConnections()
+                    expireIdleConnections()
                 }
             } catch (_: ClosedSelectorException) {
                 // Normal during shutdown.
@@ -123,9 +149,11 @@ internal class TcpRelayPool(
                         remote = registration.remote,
                         trafficListener = registration.trafficListener,
                         closeListener = registration.closeListener,
+                        initialBufferSize = initialBufferSize,
                     )
                     connection.register(selector)
                     connections.add(connection)
+                    touch(connection)
                 } catch (error: Exception) {
                     Log.d(TAG, "Unable to register TCP relay: ${error.message}")
                     registration.reject()
@@ -133,22 +161,49 @@ internal class TcpRelayPool(
             }
         }
 
+        private fun drainMaintenance() {
+            while (true) maintenance.poll()?.invoke() ?: return
+        }
+
         private fun drainAndRejectPending() {
             while (true) pending.poll()?.reject() ?: return
         }
 
-        private fun closeIdleConnections() {
+        private fun expireIdleConnections() {
             val now = System.nanoTime()
-            connections.toList().forEach { connection ->
-                if (now - connection.lastActivityNanos >= IDLE_TIMEOUT_NANOS) {
+            idleWheel.expire(now) { connection ->
+                if (connection.isTimedOut(now)) {
                     connection.close(failed = false)
+                } else {
+                    touch(connection)
                 }
             }
         }
 
+        fun touch(connection: Connection) {
+            idleWheel.schedule(connection, connection.timeoutDeadlineNanos())
+        }
+
         fun remove(connection: Connection) {
             connections.remove(connection)
+            idleWheel.remove(connection)
         }
+
+        fun markHalfClosed() = halfClosedConnections.incrementAndGet()
+
+        fun unmarkHalfClosed() = halfClosedConnections.decrementAndGet()
+
+
+        fun trimMemory() {
+            maintenance.add(buffers::clear)
+            selector.wakeup()
+        }
+
+        fun connectionCount(): Int = connections.size
+
+        fun halfClosedConnectionCount(): Int = halfClosedConnections.get().coerceAtLeast(0)
+
+        fun pooledBufferBytes(): Int = buffers.pooledBytes()
 
         override fun close() {
             if (!running.compareAndSet(true, false)) return
@@ -164,10 +219,18 @@ internal class TcpRelayPool(
         private val remote: SocketChannel,
         private val trafficListener: TrafficListener,
         private val closeListener: CloseListener,
+        initialBufferSize: Int,
     ) {
         private val closed = AtomicBoolean(false)
         private var upload: ByteBuffer? = null
         private var download: ByteBuffer? = null
+        private var uploadBufferSize = initialBufferSize
+        private var downloadBufferSize = initialBufferSize
+        private var uploadSmallReads = 0
+        private var downloadSmallReads = 0
+        private var clientInputClosed = false
+        private var remoteInputClosed = false
+        private var halfCloseCounted = false
 
         private lateinit var clientKey: SelectionKey
         private lateinit var remoteKey: SelectionKey
@@ -206,7 +269,7 @@ internal class TcpRelayPool(
             val count = source.read(buffer)
             if (count < 0) {
                 releaseBuffer(clientSide)
-                close(failed = false)
+                onInputClosed(clientSide, sourceKey)
                 return
             }
             if (count == 0) {
@@ -214,6 +277,8 @@ internal class TcpRelayPool(
                 return
             }
             lastActivityNanos = System.nanoTime()
+            lane.touch(this)
+            adaptBufferSize(clientSide, count, buffer.capacity())
             buffer.flip()
             removeInterest(sourceKey, SelectionKey.OP_READ)
             addInterest(destinationKey, SelectionKey.OP_WRITE)
@@ -232,6 +297,7 @@ internal class TcpRelayPool(
             val count = destination.write(buffer)
             if (count > 0) {
                 lastActivityNanos = System.nanoTime()
+                lane.touch(this)
                 trafficListener.onTraffic(
                     if (clientSide) 0 else count.toLong(),
                     if (clientSide) count.toLong() else 0,
@@ -254,16 +320,68 @@ internal class TcpRelayPool(
             download?.let(buffers::release)
             upload = null
             download = null
+            if (halfCloseCounted) lane.unmarkHalfClosed()
             lane.remove(this)
             closeListener.onClosed(failed)
         }
 
         private fun bufferForRead(clientSide: Boolean): ByteBuffer {
             if (clientSide) {
-                return upload ?: buffers.acquire().also { upload = it }
+                return upload ?: buffers.acquire(uploadBufferSize).also { upload = it }
             }
-            return download ?: buffers.acquire().also { download = it }
+            return download ?: buffers.acquire(downloadBufferSize).also { download = it }
         }
+
+        private fun adaptBufferSize(clientSide: Boolean, count: Int, capacity: Int) {
+            val current = if (clientSide) uploadBufferSize else downloadBufferSize
+            val smallReads = if (clientSide) uploadSmallReads else downloadSmallReads
+            val updated: Int
+            val updatedSmallReads: Int
+            if (count == capacity && current < MAX_BUFFER_SIZE) {
+                updated = (current * 2).coerceAtMost(MAX_BUFFER_SIZE)
+                updatedSmallReads = 0
+            } else if (count < current / 4 && current > MIN_BUFFER_SIZE) {
+                updatedSmallReads = smallReads + 1
+                updated = if (updatedSmallReads >= SMALL_READS_TO_SHRINK) {
+                    (current / 2).coerceAtLeast(MIN_BUFFER_SIZE)
+                } else {
+                    current
+                }
+            } else {
+                updated = current
+                updatedSmallReads = 0
+            }
+            if (clientSide) {
+                uploadBufferSize = updated
+                uploadSmallReads = if (updated != current) 0 else updatedSmallReads
+            } else {
+                downloadBufferSize = updated
+                downloadSmallReads = if (updated != current) 0 else updatedSmallReads
+            }
+        }
+
+        private fun onInputClosed(clientSide: Boolean, sourceKey: SelectionKey) {
+            removeInterest(sourceKey, SelectionKey.OP_READ)
+            if (!halfCloseCounted) {
+                halfCloseCounted = true
+                lane.markHalfClosed()
+            }
+            if (clientSide) {
+                clientInputClosed = true
+                runCatching { remote.shutdownOutput() }
+            } else {
+                remoteInputClosed = true
+                runCatching { client.shutdownOutput() }
+            }
+            lastActivityNanos = System.nanoTime()
+            lane.touch(this)
+            if (clientInputClosed && remoteInputClosed) close(failed = false)
+        }
+
+        fun timeoutDeadlineNanos(): Long = lastActivityNanos +
+            TcpTimeoutPolicy.timeoutNanos(clientInputClosed || remoteInputClosed)
+
+        fun isTimedOut(nowNanos: Long): Boolean = nowNanos >= timeoutDeadlineNanos()
 
         private fun releaseBuffer(clientSide: Boolean) {
             if (clientSide) {
@@ -285,30 +403,39 @@ internal class TcpRelayPool(
     }
 
     private class DirectBufferPool {
-        private val available = ConcurrentLinkedQueue<ByteBuffer>()
-        private val pooled = AtomicInteger()
+        private val available = HashMap<Int, ConcurrentLinkedQueue<ByteBuffer>>()
+        private val pooledBytes = AtomicInteger()
 
-        fun acquire(): ByteBuffer {
-            val buffer = available.poll()
+        fun acquire(size: Int): ByteBuffer {
+            val queue = available.getOrPut(size) { ConcurrentLinkedQueue() }
+            val buffer = queue.poll()
             if (buffer != null) {
-                pooled.decrementAndGet()
+                pooledBytes.addAndGet(-buffer.capacity())
                 buffer.clear()
                 return buffer
             }
-            return ByteBuffer.allocateDirect(BUFFER_SIZE)
+            return ByteBuffer.allocateDirect(size)
         }
 
         fun release(buffer: ByteBuffer) {
             buffer.clear()
             while (true) {
-                val count = pooled.get()
-                if (count >= MAX_POOLED_BUFFERS_PER_LANE) return
-                if (pooled.compareAndSet(count, count + 1)) {
-                    available.add(buffer)
+                val bytes = pooledBytes.get()
+                if (bytes + buffer.capacity() > MAX_POOLED_BYTES_PER_LANE) return
+                if (pooledBytes.compareAndSet(bytes, bytes + buffer.capacity())) {
+                    available.getOrPut(buffer.capacity()) { ConcurrentLinkedQueue() }.add(buffer)
                     return
                 }
             }
         }
+
+
+        fun clear() {
+            available.clear()
+            pooledBytes.set(0)
+        }
+
+        fun pooledBytes(): Int = pooledBytes.get()
     }
 
     private data class Endpoint(
@@ -331,10 +458,13 @@ internal class TcpRelayPool(
 
     companion object {
         private const val TAG = "GatewaveTcpRelay"
-        private const val BUFFER_SIZE = 32 * 1024
-        private const val MAX_POOLED_BUFFERS_PER_LANE = 32
+        private const val MIN_BUFFER_SIZE = 8 * 1024
+        private const val DEFAULT_INITIAL_BUFFER_SIZE = 16 * 1024
+        private const val MAX_BUFFER_SIZE = 64 * 1024
+        private const val SMALL_READS_TO_SHRINK = 8
+        private const val MAX_POOLED_BYTES_PER_LANE = 4 * 1024 * 1024
         private const val SELECT_TIMEOUT_MS = 1_000L
-        private const val IDLE_TIMEOUT_NANOS =
-            Socks5Session.TCP_IDLE_TIMEOUT_MS * 1_000_000L
+        private const val IDLE_TICK_NANOS = 1_000_000_000L
+        private const val IDLE_WHEEL_SIZE = 256
     }
 }

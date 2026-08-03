@@ -11,8 +11,8 @@ if (releaseSigningReady) {
 }
 
 android {
-    namespace 'com.hexf11.gatewave'
-    buildToolsVersion '36.1.0'
+    namespace = 'com.hexf11.gatewave'
+    buildToolsVersion = '36.1.0'
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
@@ -20,11 +20,11 @@ android {
     }
 
     defaultConfig {
-        applicationId 'com.hexf11.gatewave'
-        minSdk 26
-        targetSdk 36
-        versionCode 3
-        versionName '0.1.2'
+        applicationId = 'com.hexf11.gatewave'
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 4
+        versionName = '0.2.0'
     }
 
     signingConfigs {
@@ -40,8 +40,8 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled true
-            shrinkResources true
+            minifyEnabled = true
+            shrinkResources = true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             if (releaseSigningReady) {
                 signingConfig signingConfigs.release
@@ -50,12 +50,13 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     buildFeatures {
-        compose true
+        compose = true
+        buildConfig = true
     }
 }
 

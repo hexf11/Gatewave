@@ -51,6 +51,12 @@ jobs:
           test -n "$KEY_ALIAS"
           test -n "$KEY_PASSWORD"
 
+      - name: 校验标签与应用版本
+        run: |
+          VERSION_NAME=$(sed -n "s/^[[:space:]]*versionName = '\([^']*\)'/\1/p" app/build.gradle)
+          test "v$VERSION_NAME" = "$GITHUB_REF_NAME"
+          test -f "docs/release-notes/$GITHUB_REF_NAME.md"
+
       - name: 写入签名材料
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}

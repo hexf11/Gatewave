@@ -9,6 +9,7 @@ import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.PriorityQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -40,6 +41,7 @@ internal class Socks5SessionReactor(
         private val selector = Selector.open()
         private val running = AtomicBoolean(true)
         private val commands = ConcurrentLinkedQueue<() -> Unit>()
+        private val scheduled = PriorityQueue<ScheduledCommand>(compareBy(ScheduledCommand::deadlineNanos))
         private val sessions = ConcurrentHashMap.newKeySet<Socks5Session>()
         private val thread = Thread(::runLoop, threadName).apply {
             isDaemon = true
@@ -70,6 +72,10 @@ internal class Socks5SessionReactor(
         fun registerRemote(channel: SocketChannel, session: Socks5Session): SelectionKey =
             channel.register(selector, SelectionKey.OP_CONNECT, RemoteEndpoint(session))
 
+        fun schedule(delayNanos: Long, command: () -> Unit) = execute {
+            scheduled.add(ScheduledCommand(System.nanoTime() + delayNanos, command))
+        }
+
         fun detach(session: Socks5Session) {
             sessions.remove(session)
         }
@@ -78,8 +84,10 @@ internal class Socks5SessionReactor(
             try {
                 while (running.get()) {
                     drainCommands()
-                    selector.select(SELECT_TIMEOUT_MS)
+                    runScheduled()
+                    selector.select(nextSelectTimeoutMs())
                     drainCommands()
+                    runScheduled()
                     val iterator = selector.selectedKeys().iterator()
                     while (iterator.hasNext()) {
                         val key = iterator.next()
@@ -108,6 +116,21 @@ internal class Socks5SessionReactor(
             while (true) commands.poll()?.invoke() ?: return
         }
 
+        private fun runScheduled() {
+            val now = System.nanoTime()
+            while (true) {
+                val task = scheduled.peek() ?: return
+                if (task.deadlineNanos > now) return
+                scheduled.poll()?.command?.invoke()
+            }
+        }
+
+        private fun nextSelectTimeoutMs(): Long {
+            val next = scheduled.peek()?.deadlineNanos ?: return SELECT_TIMEOUT_MS
+            val remainingNanos = (next - System.nanoTime()).coerceAtLeast(0)
+            return ((remainingNanos + 999_999) / 1_000_000).coerceIn(1, SELECT_TIMEOUT_MS)
+        }
+
         private fun expireSessions() {
             val now = System.nanoTime()
             sessions.toList().forEach { if (it.isExpired(now)) it.onTimeout() }
@@ -121,6 +144,7 @@ internal class Socks5SessionReactor(
     }
 
     private data class RemoteEndpoint(val session: Socks5Session)
+    private data class ScheduledCommand(val deadlineNanos: Long, val command: () -> Unit)
 
     companion object {
         private const val TAG = "GatewaveHandshake"

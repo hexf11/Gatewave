@@ -57,7 +57,7 @@ internal object NetworkDiagnostics {
         val generatedAt = DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(ZonedDateTime.now())
         val detail = error.message ?: error.javaClass.simpleName
         val check = fail("diagnostics", "诊断执行", detail)
-        val text = "Gatewave v$APP_VERSION 网络诊断\n时间: $generatedAt\n" +
+        val text = "Gatewave v${BuildConfig.VERSION_NAME} 网络诊断\n时间: $generatedAt\n" +
             "[FAIL] 诊断执行: $detail\n\n结果: 未通过（失败 1 项）\n"
         return DiagnosticReport(generatedAt, listOf(check), false, 0, "--", text)
     }
@@ -105,6 +105,18 @@ internal object NetworkDiagnostics {
             pass("service", "代理服务", "正在监听 SOCKS5 ${settings.socksPort}")
         } else {
             fail("service", "代理服务", "服务未启动")
+        }
+
+        checks += if (status.running && status.stats.maxSessions > 0) {
+            pass(
+                "performance",
+                "性能数据面",
+                "${performanceLabel(settings.performanceMode)} · 容量 ${status.stats.maxSessions} · " +
+                    "TCP Selector ${status.stats.tcpSelectorLanes} · " +
+                    "UDP Selector ${status.stats.udpSelectorLanes}",
+            )
+        } else {
+            warning("performance", "性能数据面", "等待服务发布容量与 Selector 指标")
         }
 
         checks += if (lanIp != "0.0.0.0") {
@@ -156,8 +168,7 @@ internal object NetworkDiagnostics {
         val text = renderReport(
             generatedAt = generatedAt,
             settings = settings,
-            lanIp = lanIp,
-            vpnInterface = vpnInterface,
+            stats = status.stats,
             checks = checks,
             passed = passed,
             warningCount = warningCount,
@@ -290,7 +301,7 @@ internal object NetworkDiagnostics {
         return try {
             connection.connectTimeout = SOCKET_TIMEOUT_MS
             connection.readTimeout = SOCKET_TIMEOUT_MS
-            connection.setRequestProperty("User-Agent", "Gatewave-Diagnostics/$APP_VERSION")
+            connection.setRequestProperty("User-Agent", "Gatewave-Diagnostics/${BuildConfig.VERSION_NAME}")
             val code = connection.responseCode
             require(code == 200) { "HTTP $code" }
             val value = connection.inputStream.bufferedReader().use { it.readText().trim() }
@@ -372,25 +383,53 @@ internal object NetworkDiagnostics {
     private fun renderReport(
         generatedAt: String,
         settings: ProxySettings,
-        lanIp: String,
-        vpnInterface: String,
+        stats: ProxyStats,
         checks: List<DiagnosticCheck>,
         passed: Boolean,
         warningCount: Int,
         exitIp: String,
     ): String = buildString {
-        appendLine("Gatewave v$APP_VERSION 网络诊断")
+        appendLine("Gatewave v${BuildConfig.VERSION_NAME} 网络诊断")
         appendLine("时间: $generatedAt")
         appendLine("设备: ${Build.MANUFACTURER} ${Build.MODEL}")
         appendLine("系统: Android ${Build.VERSION.RELEASE} / API ${Build.VERSION.SDK_INT}")
         appendLine("目标版本: API 36")
-        appendLine("LAN: $lanIp:${settings.socksPort}")
+        appendLine("性能模式: ${performanceLabel(settings.performanceMode)}")
+        appendLine("LAN: 地址已隐藏:${settings.socksPort}")
         appendLine("订阅端口: ${settings.subscriptionPort}")
-        appendLine("VPN 接口: $vpnInterface")
-        appendLine("出口 IP: $exitIp")
+        appendLine("VPN 接口: ${if (exitIp == "--") "未验证" else "已验证（标识已隐藏）"}")
+        appendLine("出口 IP: ${if (exitIp == "--") "未获取" else "已获取（地址已隐藏）"}")
+        appendLine(
+            "容量: ${stats.maxSessions} 会话 / ${stats.maxUdpAssociations} UDP · " +
+                "峰值 ${stats.peakConnections} · 活跃设备 ${stats.activeClients}",
+        )
+        appendLine(
+                "数据面: TCP Selector ${stats.tcpSelectorLanes} · UDP Selector ${stats.udpSelectorLanes} · " +
+                "TCP 缓冲池 ${stats.tcpPooledBufferBytes} bytes · 半关闭 ${stats.tcpHalfClosedConnections}",
+        )
+        appendLine(
+            "DNS: 缓存 ${stats.dnsCacheEntries} · 命中 ${stats.dnsCacheHits} · " +
+                "查询 ${stats.dnsCacheMisses} · 合并 ${stats.dnsCoalesced}",
+        )
+        appendLine(
+            "建连: P50 ${stats.connectP50Ms}ms · P95 ${stats.connectP95Ms}ms · " +
+                "UDP 丢弃 ${stats.udpDropped} · 公平回收 ${stats.fairnessReclaims}",
+        )
         appendLine()
         checks.forEach { check ->
-            appendLine("[${check.level.name}] ${check.title}: ${check.detail}")
+            val anonymousDetail = when (check.id) {
+                "lan" -> if (check.level == DiagnosticLevel.PASS) {
+                    "已检测到私有局域网地址（地址已隐藏）"
+                } else check.detail
+                "vpn" -> if (check.level == DiagnosticLevel.PASS) {
+                    "默认网络为系统 VPN（接口与网络标识已隐藏）"
+                } else check.detail
+                "exit_ip" -> if (check.level == DiagnosticLevel.PASS) {
+                    "已通过 VPN 获取出口地址（地址已隐藏）"
+                } else check.detail
+                else -> check.detail
+            }
+            appendLine("[${check.level.name}] ${check.title}: $anonymousDetail")
         }
         appendLine()
         appendLine(
@@ -399,11 +438,16 @@ internal object NetworkDiagnostics {
         )
     }
 
+    private fun performanceLabel(mode: PerformanceMode): String = when (mode) {
+        PerformanceMode.BALANCED -> "均衡"
+        PerformanceMode.TURBO -> "极速"
+        PerformanceMode.POWER_SAVE -> "省电"
+    }
+
     private val IPV4_LOOPBACK: InetAddress = InetAddress.getByName("127.0.0.1")
     private const val SOCKET_TIMEOUT_MS = 7_000
     private const val UDP_TIMEOUT_MS = 8_000
     private const val MAX_HTTP_BYTES = 128 * 1024
-    private const val APP_VERSION = "0.1.1"
     private const val DNS_QUERY_ID = 0x5058
     private const val DNS_SERVER = "8.8.4.4"
     private const val EXIT_IP_URL = "https://api.ipify.org"

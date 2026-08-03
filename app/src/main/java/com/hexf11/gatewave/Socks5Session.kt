@@ -13,7 +13,6 @@ import java.nio.channels.SelectionKey
 import java.nio.channels.Selector
 import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -25,7 +24,7 @@ internal class Socks5Session(
     private val listener: Listener,
     private val tcpRelayPool: TcpRelayPool,
     private val dnsResolver: VpnDnsResolver,
-    private val udpExecutor: ExecutorService,
+    private val udpRelayPool: UdpRelayPool,
     private val udpSlots: Semaphore,
 ) {
     enum class Type { NEGOTIATING, TCP, UDP }
@@ -36,6 +35,7 @@ internal class Socks5Session(
 
     internal interface Listener {
         fun onTypeChanged(session: Socks5Session, type: Type)
+        fun onConnectResult(milliseconds: Long, success: Boolean)
         fun onClosed(session: Socks5Session)
         fun onTraffic(uploaded: Long, downloaded: Long)
     }
@@ -52,9 +52,16 @@ internal class Socks5Session(
     }
 
     private data class Request(val command: Int, val host: String, val port: Int)
+    private data class ConnectAttempt(
+        val channel: SocketChannel,
+        val address: InetAddress,
+        var key: SelectionKey? = null,
+    )
 
     private val closed = AtomicBoolean(false)
     private val input = ByteBuffer.allocate(CONTROL_BUFFER_SIZE)
+    private val clientIp: InetAddress = client.socket().inetAddress
+    private val openedAtNanos = System.nanoTime()
 
     @Volatile
     private var lane: Socks5SessionReactor.Lane? = null
@@ -78,6 +85,12 @@ internal class Socks5Session(
     private var afterOutput: (() -> Unit)? = null
     private var candidates = emptyList<InetAddress>()
     private var candidateIndex = 0
+    private val connectAttempts = mutableListOf<ConnectAttempt>()
+    private var connectVpn: Network? = null
+    private var nextAttemptScheduled = false
+    private var connectGeneration = 0
+    private var connectStartedNanos = 0L
+    private var connectMetricReported = false
     private var requestPort = 0
     private var deadlineNanos = System.nanoTime() + HANDSHAKE_TIMEOUT_NANOS
 
@@ -105,14 +118,14 @@ internal class Socks5Session(
 
     internal fun handleRemote(key: SelectionKey) {
         if (closed.get() || state != State.CONNECTING || !key.isValid) return
+        val attempt = connectAttempts.firstOrNull { it.channel === key.channel() } ?: return
         try {
-            if (key.isConnectable && checkNotNull(remoteChannel).finishConnect()) {
+            if (key.isConnectable && attempt.channel.finishConnect()) {
                 key.interestOps(0)
-                onConnected()
+                onConnected(attempt)
             }
         } catch (error: Exception) {
-            Log.d(TAG, "CONNECT candidate failed: ${error.message}")
-            tryNextCandidate()
+            failAttempt(attempt)
         }
     }
 
@@ -255,11 +268,17 @@ internal class Socks5Session(
         state = State.RESOLVING
         deadlineNanos = System.nanoTime() + CONNECT_TIMEOUT_NANOS
         requestPort = request.port
+        connectVpn = vpn
+        connectStartedNanos = System.nanoTime()
+        connectGeneration++
         setClientInterest(0)
         dnsResolver.resolve(vpn, request.host) { result ->
             executeOnLane {
                 if (closed.get() || state != State.RESOLVING) return@executeOnLane
-                candidates = result.addresses.filterNot(NetworkUtils::isBlockedTarget)
+                candidates = dnsResolver.orderedAddresses(
+                    vpn,
+                    result.addresses.filterNot(NetworkUtils::isBlockedTarget),
+                )
                 candidateIndex = 0
                 if (candidates.isEmpty()) {
                     val reply = if (result.addresses.isNotEmpty()) {
@@ -270,53 +289,87 @@ internal class Socks5Session(
                     replyAndClose(reply, result.error?.message ?: "Destination unresolved or blocked")
                 } else {
                     state = State.CONNECTING
-                    tryNextCandidate()
+                    startNextCandidate()
                 }
             }
         }
     }
 
-    private fun tryNextCandidate() {
-        remoteKey?.cancel()
-        remoteKey = null
-        runCatching { remoteChannel?.close() }
-        remoteChannel = null
-
-        val vpn = networkProvider.currentVpnNetwork()
+    private fun startNextCandidate() {
+        val vpn = connectVpn
         if (vpn == null) {
             replyAndClose(REPLY_NETWORK_UNREACHABLE, "VPN network changed during connect")
             return
         }
         while (candidateIndex < candidates.size) {
             val address = candidates[candidateIndex++]
+            var channel: SocketChannel? = null
             try {
-                val channel = SocketChannel.open()
+                channel = SocketChannel.open()
                 channel.configureBlocking(false)
                 val socket = channel.socket()
                 vpn.bindSocket(socket)
                 socket.tcpNoDelay = true
                 socket.keepAlive = true
-                remoteChannel = channel
+                val attempt = ConnectAttempt(channel, address)
+                connectAttempts += attempt
                 if (channel.connect(InetSocketAddress(address, requestPort))) {
-                    onConnected()
+                    onConnected(attempt)
                 } else {
-                    remoteKey = checkNotNull(lane).registerRemote(channel, this)
+                    attempt.key = checkNotNull(lane).registerRemote(channel, this)
+                    scheduleNextCandidate()
                 }
                 return
             } catch (error: Exception) {
-                Log.d(TAG, "CONNECT $address:$requestPort failed: ${error.message}")
-                runCatching { remoteChannel?.close() }
-                remoteChannel = null
+                dnsResolver.recordConnectFailure(vpn, address)
+                runCatching { channel?.close() }
             }
         }
-        replyAndClose(REPLY_HOST_UNREACHABLE, "All destination addresses failed")
+        if (connectAttempts.isEmpty()) {
+            replyAndClose(REPLY_HOST_UNREACHABLE, "All destination addresses failed")
+        }
     }
 
-    private fun onConnected() {
-        val remote = remoteChannel ?: run {
-            replyAndClose(REPLY_GENERAL_FAILURE, "Connected channel missing")
+    private fun scheduleNextCandidate() {
+        if (candidateIndex >= candidates.size || nextAttemptScheduled) return
+        nextAttemptScheduled = true
+        val generation = connectGeneration
+        checkNotNull(lane).schedule(HAPPY_EYEBALLS_DELAY_NANOS) {
+            nextAttemptScheduled = false
+            if (!closed.get() && state == State.CONNECTING && generation == connectGeneration) {
+                startNextCandidate()
+            }
+        }
+    }
+
+    private fun failAttempt(attempt: ConnectAttempt) {
+        connectAttempts.remove(attempt)
+        attempt.key?.cancel()
+        runCatching { attempt.channel.close() }
+        connectVpn?.let { dnsResolver.recordConnectFailure(it, attempt.address) }
+        if (candidateIndex < candidates.size) startNextCandidate()
+        else if (connectAttempts.isEmpty()) {
+            replyAndClose(REPLY_HOST_UNREACHABLE, "All destination addresses failed")
+        }
+    }
+
+    private fun onConnected(winner: ConnectAttempt) {
+        if (state != State.CONNECTING) {
+            runCatching { winner.channel.close() }
             return
         }
+        connectAttempts.toList().forEach { attempt ->
+            if (attempt !== winner) {
+                attempt.key?.cancel()
+                runCatching { attempt.channel.close() }
+            }
+        }
+        connectAttempts.clear()
+        connectVpn?.let { dnsResolver.recordConnectSuccess(it, winner.address) }
+        reportConnectMetric(success = true)
+        remoteChannel = winner.channel
+        remoteKey = winner.key
+        val remote = winner.channel
         val bound = remote.socket().localSocketAddress as? InetSocketAddress
         state = State.WRITING_REPLY
         queueOutput(replyBytes(REPLY_SUCCEEDED, bound)) { handOffTcpRelay() }
@@ -363,8 +416,8 @@ internal class Socks5Session(
                 relayAddress = client.socket().localAddress,
                 expectedClientAddress = client.socket().inetAddress,
                 requestedClientPort = request.port,
-                executor = udpExecutor,
                 dnsResolver = dnsResolver,
+                lane = udpRelayPool.lane(),
                 listener = UdpRelay.Listener { _, relayFailed ->
                     executeOnLane {
                         if (relayFailed) failed = true
@@ -453,9 +506,15 @@ internal class Socks5Session(
 
     private fun finish() {
         if (!closed.compareAndSet(false, true)) return
+        reportConnectMetric(success = false)
         state = State.CLOSED
         if (::clientKey.isInitialized) runCatching { clientKey.cancel() }
         runCatching { remoteKey?.cancel() }
+        connectAttempts.forEach { attempt ->
+            runCatching { attempt.key?.cancel() }
+            runCatching { attempt.channel.close() }
+        }
+        connectAttempts.clear()
         udpRelay?.close()
         runCatching { client.close() }
         runCatching { remoteChannel?.close() }
@@ -467,7 +526,18 @@ internal class Socks5Session(
         listener.onClosed(this)
     }
 
+    private fun reportConnectMetric(success: Boolean) {
+        if (connectMetricReported || connectStartedNanos == 0L) return
+        connectMetricReported = true
+        val elapsedMs = (System.nanoTime() - connectStartedNanos).coerceAtLeast(0) / 1_000_000
+        listener.onConnectResult(elapsedMs, success)
+    }
+
     fun type(): Type = type
+
+    fun clientAddress(): InetAddress = clientIp
+
+    fun openedAtNanos(): Long = openedAtNanos
 
     fun failed(): Boolean = failed
 
@@ -502,7 +572,8 @@ internal class Socks5Session(
         private const val REPLY_ADDRESS_NOT_SUPPORTED = 0x08
         private const val CONTROL_BUFFER_SIZE = 512
         private const val HANDSHAKE_TIMEOUT_NANOS = 15_000_000_000L
-        private const val CONNECT_TIMEOUT_NANOS = 15_000_000_000L
+        private const val CONNECT_TIMEOUT_NANOS = 30_000_000_000L
+        private const val HAPPY_EYEBALLS_DELAY_NANOS = 250_000_000L
         const val TCP_IDLE_TIMEOUT_MS = 180_000
 
         private fun unsigned(value: Byte): Int = value.toInt() and 0xFF

@@ -63,4 +63,34 @@ class VpnDnsResolverTest {
         assertEquals(2, lookups.get())
         resolver.close()
     }
+
+    @Test
+    fun `失败地址降级且成功后恢复原始 DNS 顺序`() {
+        val resolver = VpnDnsResolver()
+        val first = InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1))
+        val second = InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8))
+
+        resolver.recordConnectFailureForTest(42, first)
+        assertEquals(listOf(second, first), resolver.orderedAddressesForTest(42, listOf(first, second)))
+        assertEquals(listOf(first, second), resolver.orderedAddressesForTest(43, listOf(first, second)))
+
+        resolver.recordConnectSuccessForTest(42, first)
+        assertEquals(listOf(first, second), resolver.orderedAddressesForTest(42, listOf(first, second)))
+        resolver.close()
+    }
+
+    @Test
+    fun `同健康等级内交替 IPv6 与 IPv4`() {
+        val resolver = VpnDnsResolver()
+        val v6a = InetAddress.getByName("2001:db8::1")
+        val v6b = InetAddress.getByName("2001:db8::2")
+        val v4a = InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1))
+        val v4b = InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8))
+
+        assertEquals(
+            listOf(v6a, v4a, v6b, v4b),
+            resolver.orderedAddressesForTest(42, listOf(v6a, v6b, v4a, v4b)),
+        )
+        resolver.close()
+    }
 }

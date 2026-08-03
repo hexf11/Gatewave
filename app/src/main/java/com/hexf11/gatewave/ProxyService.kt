@@ -12,6 +12,7 @@ import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -46,6 +47,10 @@ internal class ProxyService : Service(), Socks5Server.Listener {
     private var server: Socks5Server? = null
     private var subscriptionServer: SubscriptionServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
+    // PowerManager.THERMAL_STATUS_NONE is an inlined API 29 constant with the value zero.
+    private var thermalStatus = 0
     private var lastNotificationState: String? = null
 
     override fun onCreate() {
@@ -54,6 +59,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         vpnResumeBlocked = ProxySettingsStore.vpnResumeBlocked(this)
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         createNotificationChannel()
+        registerThermalMonitor()
         registerNetworkMonitor()
         refreshLanAddress()
         refreshVpnNetwork()
@@ -106,6 +112,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         val candidate = Socks5Server(
             port = settings.socksPort,
             udpEnabled = settings.udpEnabled,
+            performanceMode = settings.performanceMode,
             networkProvider = Socks5Session.NetworkProvider { vpnNetwork },
             listener = this,
         )
@@ -118,6 +125,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         server = candidate
         stats = ProxyStats.empty()
         started = true
+        updateWifiPerformanceLock()
 
         if (wantsSubscription) {
             try {
@@ -134,6 +142,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
 
     private fun stopRuntime() {
         started = false
+        releaseWifiLock()
         subscriptionEnabled = false
         subscriptionServer?.stop()
         subscriptionServer = null
@@ -350,6 +359,49 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         ).also { it.acquire() }
     }
 
+    @Suppress("DEPRECATION")
+    private fun updateWifiPerformanceLock() {
+        val shouldHold = started &&
+            settings.performanceMode == PerformanceMode.TURBO &&
+            (Build.VERSION.SDK_INT < 29 || thermalStatus < PowerManager.THERMAL_STATUS_SEVERE)
+        if (!shouldHold) {
+            releaseWifiLock()
+            return
+        }
+        if (wifiLock?.isHeld == true) return
+        val wifiManager = applicationContext.getSystemService(WifiManager::class.java) ?: return
+        val mode = if (Build.VERSION.SDK_INT >= 29) {
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        } else {
+            WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        }
+        wifiLock = wifiManager.createWifiLock(mode, "$packageName:turbo").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseWifiLock() {
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
+    }
+
+    private fun registerThermalMonitor() {
+        if (Build.VERSION.SDK_INT < 29) return
+        val powerManager = getSystemService(PowerManager::class.java)
+        thermalStatus = powerManager.currentThermalStatus
+        val listener = PowerManager.OnThermalStatusChangedListener { status ->
+            thermalStatus = status
+            updateWifiPerformanceLock()
+            if (status >= PowerManager.THERMAL_STATUS_SEVERE) {
+                server?.trimMemory()
+                publishStatus("设备温度较高，已降低 Wi-Fi 性能锁并回收空闲缓冲")
+            }
+        }
+        thermalListener = listener
+        powerManager.addThermalStatusListener(listener)
+    }
+
     private fun currentRunningMessage(): String = when {
         vpnResumeBlocked -> "等待手动重启代理（VPN 自动恢复已关闭）"
         vpnNetwork != null -> "代理已启动，出口锁定系统 VPN"
@@ -393,7 +445,10 @@ internal class ProxyService : Service(), Socks5Server.Listener {
     }
 
     override fun onStatsChanged(stats: ProxyStats) {
-        if (stats.sameAs(this.stats)) return
+        if (stats.sameAs(this.stats)) {
+            ProxyStatus.flushLatestIfDue(this)
+            return
+        }
         this.stats = stats
         publishStatus(currentRunningMessage())
     }
@@ -451,6 +506,12 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             runCatching { connectivityManager.unregisterNetworkCallback(callback) }
         }
         wakeLock?.let { if (it.isHeld) it.release() }
+        releaseWifiLock()
+        if (Build.VERSION.SDK_INT >= 29) {
+            thermalListener?.let {
+                runCatching { getSystemService(PowerManager::class.java).removeThermalStatusListener(it) }
+            }
+        }
         ProxyStatus(
             running = false,
             vpnReady = false,
@@ -462,6 +523,12 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             message = "服务已停止",
         ).publish(this, persistNow = true)
         super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_LOW) server?.trimMemory()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

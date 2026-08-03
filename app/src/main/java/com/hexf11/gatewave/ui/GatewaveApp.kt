@@ -102,6 +102,7 @@ import com.hexf11.gatewave.DiagnosticCheck
 import com.hexf11.gatewave.DiagnosticLevel
 import com.hexf11.gatewave.DiagnosticsUiState
 import com.hexf11.gatewave.ProxyUiState
+import com.hexf11.gatewave.PerformanceMode
 import com.hexf11.gatewave.ProxySettingsStore
 import com.hexf11.gatewave.SettingsUpdateResult
 import com.hexf11.gatewave.ThemeMode
@@ -127,6 +128,7 @@ fun GatewaveApp(
     onSetStartOnAppLaunch: (Boolean) -> SettingsUpdateResult,
     onSetStartOnBoot: (Boolean) -> SettingsUpdateResult,
     onSetThemeMode: (ThemeMode) -> SettingsUpdateResult,
+    onSetPerformanceMode: (PerformanceMode) -> SettingsUpdateResult,
     onResetSettings: () -> SettingsUpdateResult,
     onRunDiagnostics: () -> Unit,
     onCopyDiagnostics: () -> Boolean,
@@ -208,6 +210,7 @@ fun GatewaveApp(
                 onSetStartOnAppLaunch = { notify(onSetStartOnAppLaunch(it).message) },
                 onSetStartOnBoot = { notify(onSetStartOnBoot(it).message) },
                 onSetThemeMode = { notify(onSetThemeMode(it).message) },
+                onSetPerformanceMode = { notify(onSetPerformanceMode(it).message) },
                 onResetSettings = { notify(onResetSettings().message) },
                 onOpenDiagnostics = {
                     showDiagnostics = true
@@ -705,6 +708,22 @@ private fun LogsScreen(state: ProxyUiState, contentPadding: PaddingValues) {
             CounterRow("累计连接", state.totalConnections.toString())
             CounterRow("失败连接", state.failedConnections.toString())
             CounterRow("拒绝连接", state.rejectedConnections.toString())
+            CounterRow("峰值连接", state.peakConnections.toString())
+            CounterRow("活跃客户端", state.activeClients.toString())
+            CounterRow("单客户端最高", state.largestClientConnections.toString())
+            CounterRow("动态容量", "${state.maxSessions} TCP/总会话 · ${state.maxUdpAssociations} UDP")
+            CounterRow("Selector", "TCP ${state.tcpSelectorLanes} · UDP ${state.udpSelectorLanes}")
+            CounterRow("建连延迟", "P50 ${state.connectP50Ms}ms · P95 ${state.connectP95Ms}ms")
+            CounterRow(
+                "DNS 缓存",
+                "${state.dnsCacheEntries} 条 · 命中 ${state.dnsCacheHits} · 查询 ${state.dnsCacheMisses} · 合并 ${state.dnsCoalesced}",
+            )
+            CounterRow("TCP 缓冲池", formatBytes(state.tcpPooledBufferBytes.toLong()))
+            CounterRow("TCP 半关闭排空", state.tcpHalfClosedConnections.toString())
+            CounterRow("实时上传", "${formatBytes(state.uploadBytesPerSecond)}/s")
+            CounterRow("实时下载", "${formatBytes(state.downloadBytesPerSecond)}/s")
+            CounterRow("UDP 丢弃", state.udpDropped.toString())
+            CounterRow("公平回收", state.fairnessReclaims.toString())
             CounterRow("上传流量", formatBytes(state.uploadBytes))
             CounterRow("下载流量", formatBytes(state.downloadBytes))
         }
@@ -777,6 +796,7 @@ private fun SettingsScreen(
     onSetStartOnAppLaunch: (Boolean) -> Unit,
     onSetStartOnBoot: (Boolean) -> Unit,
     onSetThemeMode: (ThemeMode) -> Unit,
+    onSetPerformanceMode: (PerformanceMode) -> Unit,
     onResetSettings: () -> Unit,
     onOpenDiagnostics: () -> Unit,
 ) {
@@ -801,7 +821,7 @@ private fun SettingsScreen(
             onDismissRequest = { showResetDialog = false },
             title = { Text("恢复默认设置？") },
             text = {
-                Text("端口、UDP、自动启动、VPN 恢复和主题将恢复默认值，配置订阅也会关闭。")
+                Text("端口、UDP、性能模式、自动启动、VPN 恢复和主题将恢复默认值，配置订阅也会关闭。")
             },
             confirmButton = {
                 TextButton(
@@ -866,6 +886,13 @@ private fun SettingsScreen(
                 checked = state.settings.autoResumeVpn,
                 description = "settings_auto_resume_vpn",
                 onCheckedChange = onSetAutoResumeVpn,
+            )
+            Spacer(Modifier.height(24.dp))
+            SectionTitle("性能模式")
+            Spacer(Modifier.height(12.dp))
+            PerformanceModeSelector(
+                selected = state.settings.performanceMode,
+                onSelected = onSetPerformanceMode,
             )
             Spacer(Modifier.height(30.dp))
             SectionTitle("启动行为")
@@ -1276,6 +1303,50 @@ private fun ThemeModeSelector(selected: ThemeMode, onSelected: (ThemeMode) -> Un
                 Text(label, style = MaterialTheme.typography.titleMedium)
             }
             if (index != ThemeMode.entries.lastIndex) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PerformanceModeSelector(
+    selected: PerformanceMode,
+    onSelected: (PerformanceMode) -> Unit,
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(0.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, MaterialTheme.colorScheme.outline, MaterialTheme.shapes.medium),
+    ) {
+        PerformanceMode.entries.forEachIndexed { index, mode ->
+            val (label, detail) = when (mode) {
+                PerformanceMode.BALANCED -> "均衡" to "动态 Selector 与 1024 会话容量"
+                PerformanceMode.TURBO -> "极速" to "Wi-Fi 低延迟锁与积极缓冲策略"
+                PerformanceMode.POWER_SAVE -> "省电" to "单 lane 与 512 会话容量"
+            }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onSelected(mode) }
+                    .padding(horizontal = 16.dp, vertical = 11.dp)
+                    .semantics { contentDescription = "performance_${mode.name.lowercase()}" },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = selected == mode, onClick = { onSelected(mode) })
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(label, style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        detail,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (index != PerformanceMode.entries.lastIndex) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             }
         }

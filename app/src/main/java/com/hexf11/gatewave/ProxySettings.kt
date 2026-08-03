@@ -9,6 +9,12 @@ enum class ThemeMode {
     DARK,
 }
 
+enum class PerformanceMode {
+    BALANCED,
+    TURBO,
+    POWER_SAVE,
+}
+
 data class ProxySettings(
     val socksPort: Int = DEFAULT_SOCKS_PORT,
     val subscriptionPort: Int = DEFAULT_SUBSCRIPTION_PORT,
@@ -16,12 +22,14 @@ data class ProxySettings(
     val autoResumeVpn: Boolean = true,
     val startOnAppLaunch: Boolean = false,
     val startOnBoot: Boolean = false,
+    val performanceMode: PerformanceMode = PerformanceMode.BALANCED,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
 ) {
     fun requiresServerRestart(other: ProxySettings): Boolean =
         socksPort != other.socksPort ||
             subscriptionPort != other.subscriptionPort ||
-            udpEnabled != other.udpEnabled
+            udpEnabled != other.udpEnabled ||
+            performanceMode != other.performanceMode
 
     companion object {
         const val DEFAULT_SOCKS_PORT = 1080
@@ -42,6 +50,11 @@ internal object ProxySettingsStore {
         val theme = runCatching {
             ThemeMode.valueOf(preferences.getString("theme_mode", null) ?: ThemeMode.SYSTEM.name)
         }.getOrDefault(ThemeMode.SYSTEM)
+        val performance = runCatching {
+            PerformanceMode.valueOf(
+                preferences.getString("performance_mode", null) ?: PerformanceMode.BALANCED.name,
+            )
+        }.getOrDefault(PerformanceMode.BALANCED)
         return ProxySettings(
             socksPort = preferences.getInt("socks_port", ProxySettings.DEFAULT_SOCKS_PORT),
             subscriptionPort = preferences.getInt(
@@ -52,6 +65,7 @@ internal object ProxySettingsStore {
             autoResumeVpn = preferences.getBoolean("auto_resume_vpn", true),
             startOnAppLaunch = preferences.getBoolean("start_on_app_launch", false),
             startOnBoot = preferences.getBoolean("start_on_boot", false),
+            performanceMode = performance,
             themeMode = theme,
         ).sanitized()
     }
@@ -65,6 +79,7 @@ internal object ProxySettingsStore {
             putBoolean("auto_resume_vpn", value.autoResumeVpn)
             putBoolean("start_on_app_launch", value.startOnAppLaunch)
             putBoolean("start_on_boot", value.startOnBoot)
+            putString("performance_mode", value.performanceMode.name)
             putString("theme_mode", value.themeMode.name)
         }
     }

@@ -62,6 +62,7 @@ class MainActivity : ComponentActivity() {
                     onSetStartOnAppLaunch = proxyViewModel::setStartOnAppLaunch,
                     onSetStartOnBoot = proxyViewModel::setStartOnBoot,
                     onSetThemeMode = proxyViewModel::setThemeMode,
+                    onSetPerformanceMode = proxyViewModel::setPerformanceMode,
                     onResetSettings = proxyViewModel::resetSettings,
                     onRunDiagnostics = proxyViewModel::runDiagnostics,
                     onCopyDiagnostics = {

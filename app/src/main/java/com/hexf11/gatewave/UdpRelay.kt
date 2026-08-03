@@ -3,27 +3,27 @@ package com.hexf11.gatewave
 import android.net.Network
 import android.util.Log
 import java.io.IOException
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.SocketException
-import java.net.SocketTimeoutException
+import java.net.StandardSocketOptions
+import java.nio.ByteBuffer
+import java.nio.channels.DatagramChannel
+import java.nio.channels.SelectionKey
+import java.nio.channels.Selector
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ExecutorService
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** One RFC 1928 UDP association, scoped to the lifetime of its TCP control session. */
+/** One RFC 1928 UDP association driven by a shared [UdpRelayPool] selector. */
 internal class UdpRelay @Throws(IOException::class) constructor(
     private val vpnNetwork: Network,
     relayAddress: InetAddress,
     private val expectedClientAddress: InetAddress,
     requestedClientPort: Int,
-    private val executor: ExecutorService,
     private val dnsResolver: VpnDnsResolver,
+    private val lane: UdpRelayPool.Lane,
     private val listener: Listener,
     private val trafficListener: TrafficListener,
 ) {
@@ -35,169 +35,193 @@ internal class UdpRelay @Throws(IOException::class) constructor(
         fun onTraffic(uploaded: Long, downloaded: Long)
     }
 
-    private val allowedRemotes = ConcurrentHashMap.newKeySet<InetSocketAddress>()
+    private data class Outgoing(
+        val bytes: ByteArray,
+        val target: InetSocketAddress,
+        val trafficBytes: Int,
+    )
+
     private val closed = AtomicBoolean(false)
-    private val firstPacketLogged = AtomicBoolean(false)
+    private val allowedRemotes = HashSet<InetSocketAddress>()
+    private val toClient = ArrayDeque<Outgoing>()
+    private val toUpstream = ArrayDeque<Outgoing>()
+    private val clientChannel = DatagramChannel.open()
+    private val upstreamChannel = DatagramChannel.open()
+    private val relayEndpoint: InetSocketAddress
+
+    private lateinit var clientKey: SelectionKey
+    private lateinit var upstreamKey: SelectionKey
+    private var clientEndpoint: InetSocketAddress? = null
 
     @Volatile
     private var lastActivityNanos = System.nanoTime()
 
-    @Volatile
-    private var clientSocket: DatagramSocket? = null
-
-    @Volatile
-    private var upstreamSocket: DatagramSocket? = null
-
-    @Volatile
-    private var clientEndpoint: InetSocketAddress? = null
-
-    private val relayEndpoint: InetSocketAddress
-
     init {
-        val lan = DatagramSocket(null)
-        var upstream: DatagramSocket? = null
         try {
-            lan.reuseAddress = true
-            lan.bind(InetSocketAddress(relayAddress, 0))
-            lan.soTimeout = 1_000
+            clientChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true)
+            clientChannel.bind(InetSocketAddress(relayAddress, 0))
+            clientChannel.configureBlocking(false)
 
-            upstream = DatagramSocket(null)
-            upstream.reuseAddress = true
-            upstream.bind(InetSocketAddress(0))
-            vpnNetwork.bindSocket(upstream)
-            upstream.soTimeout = 1_000
+            upstreamChannel.setOption(StandardSocketOptions.SO_REUSEADDR, true)
+            upstreamChannel.bind(InetSocketAddress(0))
+            vpnNetwork.bindSocket(upstreamChannel.socket())
+            upstreamChannel.configureBlocking(false)
 
-            clientSocket = lan
-            upstreamSocket = upstream
-            relayEndpoint = InetSocketAddress(relayAddress, lan.localPort)
+            relayEndpoint = clientChannel.localAddress as InetSocketAddress
             if (requestedClientPort != 0) {
                 clientEndpoint = InetSocketAddress(expectedClientAddress, requestedClientPort)
             }
         } catch (error: Exception) {
-            lan.close()
-            upstream?.close()
+            runCatching { clientChannel.close() }
+            runCatching { upstreamChannel.close() }
             throw error
         }
     }
 
-    fun start() {
-        executor.execute(::clientToRemoteLoop)
-        executor.execute(::remoteToClientLoop)
-        Log.i(TAG, "UDP ASSOCIATE relay=$relayEndpoint via network=$vpnNetwork")
-    }
+    fun start() = lane.register(this)
 
     fun relayEndpoint(): InetSocketAddress = relayEndpoint
 
-    private fun clientToRemoteLoop() {
-        val buffer = ByteArray(RECEIVE_BUFFER_SIZE)
-        val packet = DatagramPacket(buffer, buffer.size)
-        while (!closed.get()) {
-            try {
-                packet.length = buffer.size
-                val lan = clientSocket ?: return
-                lan.receive(packet)
-                if (!acceptClient(packet)) continue
+    internal fun register(udpLane: UdpRelayPool.Lane, selector: Selector) {
+        check(udpLane === lane)
+        clientKey = clientChannel.register(
+            selector,
+            SelectionKey.OP_READ,
+            UdpRelayPool.Endpoint(this, clientSide = true),
+        )
+        upstreamKey = upstreamChannel.register(
+            selector,
+            SelectionKey.OP_READ,
+            UdpRelayPool.Endpoint(this, clientSide = false),
+        )
+    }
 
-                val request = SocksUdpDatagram.decode(packet.data, packet.length)
-                val remoteAddress = resolvePublicAddress(request.host)
-                if (remoteAddress == null) {
-                    Log.w(TAG, "Dropped blocked/unresolved UDP target ${request.host}")
-                    continue
-                }
-
-                val remote = InetSocketAddress(remoteAddress, request.port)
-                if (!allowedRemotes.contains(remote) && allowedRemotes.size >= MAX_REMOTE_ENDPOINTS) {
-                    Log.w(TAG, "Dropped UDP target: remote endpoint limit $MAX_REMOTE_ENDPOINTS")
-                    continue
-                }
-                allowedRemotes.add(remote)
-                upstreamSocket?.send(DatagramPacket(request.payload, request.payload.size, remote))
-                    ?: return
-                lastActivityNanos = System.nanoTime()
-                trafficListener.onTraffic(request.payload.size.toLong(), 0)
-
-                if (firstPacketLogged.compareAndSet(false, true)) {
-                    Log.i(
-                        TAG,
-                        "UDP ${request.host}:${request.port} bytes=${request.payload.size} " +
-                            "via network=$vpnNetwork",
-                    )
-                }
-            } catch (_: SocketTimeoutException) {
-                if (isIdle()) {
-                    closeForIdle()
-                    return
-                }
-            } catch (error: SocketException) {
-                if (!closed.get()) fatal("LAN UDP socket failed: ${error.message}")
-                return
-            } catch (error: Exception) {
-                Log.w(TAG, "Dropped malformed/failed UDP request: ${error.message}")
-            }
+    internal fun handle(key: SelectionKey, clientSide: Boolean, receiveBuffer: ByteBuffer) {
+        if (closed.get() || !key.isValid) return
+        try {
+            if (key.isReadable) receive(clientSide, receiveBuffer)
+            if (!closed.get() && key.isValid && key.isWritable) flush(clientSide)
+        } catch (error: Exception) {
+            fatal("UDP channel failed: ${error.message}")
         }
     }
 
-    private fun remoteToClientLoop() {
-        val buffer = ByteArray(RECEIVE_BUFFER_SIZE)
-        val packet = DatagramPacket(buffer, buffer.size)
-        while (!closed.get()) {
-            try {
-                packet.length = buffer.size
-                val upstream = upstreamSocket ?: return
-                upstream.receive(packet)
-                val remote = InetSocketAddress(packet.address, packet.port)
-                if (!allowedRemotes.contains(remote)) {
-                    Log.w(TAG, "Dropped UDP reply from unrequested remote $remote")
-                    continue
-                }
-                val client = clientEndpoint ?: continue
-                val response = SocksUdpDatagram.encode(
-                    packet.address,
-                    packet.port,
-                    packet.data,
-                    packet.length,
-                )
-                if (response.size > MAX_DATAGRAM_SIZE) {
-                    Log.w(TAG, "Dropped oversized UDP response bytes=${response.size}")
-                    continue
-                }
-                clientSocket?.send(DatagramPacket(response, response.size, client)) ?: return
-                lastActivityNanos = System.nanoTime()
-                trafficListener.onTraffic(0, packet.length.toLong())
-            } catch (_: SocketTimeoutException) {
-                if (isIdle()) {
-                    closeForIdle()
-                    return
-                }
-            } catch (error: SocketException) {
-                if (!closed.get()) fatal("VPN UDP socket failed: ${error.message}")
-                return
-            } catch (error: Exception) {
-                Log.w(TAG, "Dropped failed UDP response: ${error.message}")
-            }
+    private fun receive(clientSide: Boolean, buffer: ByteBuffer) {
+        val channel = if (clientSide) clientChannel else upstreamChannel
+        repeat(MAX_IO_BATCH) {
+            buffer.clear()
+            val source = channel.receive(buffer) as? InetSocketAddress ?: return
+            val length = buffer.position()
+            if (length == 0) return@repeat
+            buffer.flip()
+            val bytes = ByteArray(length)
+            buffer.get(bytes)
+            if (clientSide) receiveFromClient(source, bytes) else receiveFromRemote(source, bytes)
         }
     }
 
-    private fun acceptClient(packet: DatagramPacket): Boolean {
-        if (expectedClientAddress != packet.address) {
-            Log.w(TAG, "Rejected UDP source IP ${packet.address}")
-            return false
-        }
+    private fun receiveFromClient(source: InetSocketAddress, bytes: ByteArray) {
+        if (source.address != expectedClientAddress) return
         val current = clientEndpoint
         if (current == null) {
-            clientEndpoint = InetSocketAddress(packet.address, packet.port)
-            return true
+            clientEndpoint = source
+        } else if (current.port != source.port) {
+            return
         }
-        return current.port == packet.port
+
+        val request = try {
+            SocksUdpDatagram.decode(bytes, bytes.size)
+        } catch (error: Exception) {
+            lane.recordDrop()
+            Log.d(TAG, "Dropped malformed UDP request: ${error.message}")
+            return
+        }
+        dnsResolver.resolve(vpnNetwork, request.host) { result ->
+            lane.execute {
+                if (closed.get()) return@execute
+                val address = result.addresses.firstOrNull { !NetworkUtils.isBlockedTarget(it) }
+                    ?: run {
+                        lane.recordDrop()
+                        return@execute
+                    }
+                val remote = InetSocketAddress(address, request.port)
+                if (remote !in allowedRemotes && allowedRemotes.size >= MAX_REMOTE_ENDPOINTS) {
+                    lane.recordDrop()
+                    return@execute
+                }
+                allowedRemotes.add(remote)
+                enqueue(
+                    queue = toUpstream,
+                    outgoing = Outgoing(request.payload, remote, request.payload.size),
+                    key = upstreamKey,
+                )
+            }
+        }
     }
 
-    @Throws(IOException::class)
-    private fun resolvePublicAddress(host: String): InetAddress? =
-        dnsResolver.resolveBlocking(vpnNetwork, host).addresses
-            .firstOrNull { !NetworkUtils.isBlockedTarget(it) }
+    private fun receiveFromRemote(source: InetSocketAddress, payload: ByteArray) {
+        if (source !in allowedRemotes) {
+            lane.recordDrop()
+            return
+        }
+        val client = clientEndpoint ?: run {
+            lane.recordDrop()
+            return
+        }
+        val response = SocksUdpDatagram.encode(source.address, source.port, payload, payload.size)
+        if (response.size > MAX_DATAGRAM_SIZE) {
+            lane.recordDrop()
+            return
+        }
+        enqueue(toClient, Outgoing(response, client, payload.size), clientKey)
+    }
+
+    private fun enqueue(
+        queue: ArrayDeque<Outgoing>,
+        outgoing: Outgoing,
+        key: SelectionKey,
+    ) {
+        if (queue.size >= MAX_PENDING_DATAGRAMS) {
+            lane.recordDrop()
+            return
+        }
+        queue.addLast(outgoing)
+        if (key.isValid) key.interestOps(key.interestOps() or SelectionKey.OP_WRITE)
+        flush(key.attachment().let { (it as UdpRelayPool.Endpoint).clientSide })
+    }
+
+    private fun flush(clientSide: Boolean) {
+        val channel = if (clientSide) clientChannel else upstreamChannel
+        val queue = if (clientSide) toClient else toUpstream
+        val key = if (clientSide) clientKey else upstreamKey
+        repeat(MAX_IO_BATCH) {
+            val outgoing = queue.firstOrNull() ?: return@repeat
+            val sent = channel.send(ByteBuffer.wrap(outgoing.bytes), outgoing.target)
+            if (sent == 0) return
+            queue.removeFirst()
+            lastActivityNanos = System.nanoTime()
+            trafficListener.onTraffic(
+                if (clientSide) 0 else outgoing.trafficBytes.toLong(),
+                if (clientSide) outgoing.trafficBytes.toLong() else 0,
+            )
+        }
+        if (queue.isEmpty() && key.isValid) {
+            key.interestOps(key.interestOps() and SelectionKey.OP_WRITE.inv())
+        }
+    }
+
+    internal fun isIdle(nowNanos: Long): Boolean =
+        !closed.get() && nowNanos - lastActivityNanos >= UDP_IDLE_TIMEOUT_NANOS
+
+    internal fun closeForIdle() {
+        if (closeInternal()) listener.onTerminated("UDP idle timeout", false)
+    }
+
+    internal fun registrationFailed(error: Throwable) {
+        if (closeInternal()) listener.onTerminated("UDP registration failed: ${error.message}", true)
+    }
 
     private fun fatal(message: String) {
-        Log.e(TAG, message)
         if (closeInternal()) listener.onTerminated(message, true)
     }
 
@@ -205,20 +229,20 @@ internal class UdpRelay @Throws(IOException::class) constructor(
         closeInternal()
     }
 
-    private fun isIdle(): Boolean =
-        System.nanoTime() - lastActivityNanos >= UDP_IDLE_TIMEOUT_MS * 1_000_000L
-
-    private fun closeForIdle() {
-        if (!closeInternal()) return
-        Log.i(TAG, "Closed idle UDP association after ${UDP_IDLE_TIMEOUT_MS}ms")
-        listener.onTerminated("UDP idle timeout", false)
+    internal fun closeFromPool() {
+        closeInternal()
     }
 
     private fun closeInternal(): Boolean {
         if (!closed.compareAndSet(false, true)) return false
-        clientSocket?.close()
-        upstreamSocket?.close()
+        if (::clientKey.isInitialized) runCatching { clientKey.cancel() }
+        if (::upstreamKey.isInitialized) runCatching { upstreamKey.cancel() }
+        runCatching { clientChannel.close() }
+        runCatching { upstreamChannel.close() }
+        toClient.clear()
+        toUpstream.clear()
         allowedRemotes.clear()
+        lane.remove(this)
         return true
     }
 
@@ -228,20 +252,17 @@ internal class UdpRelay @Throws(IOException::class) constructor(
         val payload: ByteArray,
     ) {
         companion object {
-            @Throws(IOException::class)
             fun decode(data: ByteArray, length: Int): SocksUdpDatagram {
                 if (length < 7) throw IOException("UDP datagram too short")
                 var offset = 0
                 if (unsigned(data[offset++]) != 0 || unsigned(data[offset++]) != 0) {
                     throw IOException("Invalid RSV field")
                 }
-                val fragment = unsigned(data[offset++])
-                if (fragment != 0) throw IOException("UDP fragmentation is unsupported")
+                if (unsigned(data[offset++]) != 0) throw IOException("UDP fragmentation unsupported")
                 val addressType = unsigned(data[offset++])
-
                 val host = when (addressType) {
                     0x01 -> {
-                        requireBytes(length, offset, 4 + 2)
+                        requireBytes(length, offset, 6)
                         InetAddress.getByAddress(data.copyOfRange(offset, offset + 4))
                             .hostAddress.orEmpty().also { offset += 4 }
                     }
@@ -254,20 +275,18 @@ internal class UdpRelay @Throws(IOException::class) constructor(
                             .also { offset += domainLength }
                     }
                     0x04 -> {
-                        requireBytes(length, offset, 16 + 2)
+                        requireBytes(length, offset, 18)
                         InetAddress.getByAddress(data.copyOfRange(offset, offset + 16))
                             .hostAddress.orEmpty().also { offset += 16 }
                     }
                     else -> throw IOException("Unsupported UDP address type $addressType")
                 }
-
                 requireBytes(length, offset, 2)
                 val port = (unsigned(data[offset++]) shl 8) or unsigned(data[offset++])
                 if (port == 0) throw IOException("Invalid UDP destination port")
                 return SocksUdpDatagram(host, port, data.copyOfRange(offset, length))
             }
 
-            @Throws(IOException::class)
             fun encode(
                 address: InetAddress,
                 port: Int,
@@ -296,7 +315,6 @@ internal class UdpRelay @Throws(IOException::class) constructor(
 
             private fun unsigned(value: Byte): Int = value.toInt() and 0xFF
 
-            @Throws(IOException::class)
             private fun requireBytes(length: Int, offset: Int, needed: Int) {
                 if (offset < 0 || needed < 0 || offset + needed > length) {
                     throw IOException("Truncated UDP datagram")
@@ -308,8 +326,9 @@ internal class UdpRelay @Throws(IOException::class) constructor(
     companion object {
         private const val TAG = "GatewaveUdp"
         private const val MAX_DATAGRAM_SIZE = 65_507
-        private const val RECEIVE_BUFFER_SIZE = 65_535
-        const val UDP_IDLE_TIMEOUT_MS = 120_000
-        const val MAX_REMOTE_ENDPOINTS = 128
+        private const val MAX_REMOTE_ENDPOINTS = 256
+        private const val MAX_PENDING_DATAGRAMS = 256
+        private const val MAX_IO_BATCH = 64
+        private const val UDP_IDLE_TIMEOUT_NANOS = 120_000_000_000L
     }
 }

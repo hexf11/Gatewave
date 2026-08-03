@@ -29,6 +29,25 @@ data class ProxyUiState(
     val rejectedConnections: Long = 0,
     val uploadBytes: Long = 0,
     val downloadBytes: Long = 0,
+    val peakConnections: Int = 0,
+    val activeClients: Int = 0,
+    val largestClientConnections: Int = 0,
+    val maxSessions: Int = 0,
+    val maxUdpAssociations: Int = 0,
+    val dnsCacheHits: Long = 0,
+    val dnsCacheMisses: Long = 0,
+    val dnsCoalesced: Long = 0,
+    val dnsCacheEntries: Int = 0,
+    val connectP50Ms: Long = 0,
+    val connectP95Ms: Long = 0,
+    val uploadBytesPerSecond: Long = 0,
+    val downloadBytesPerSecond: Long = 0,
+    val udpDropped: Long = 0,
+    val fairnessReclaims: Long = 0,
+    val tcpSelectorLanes: Int = 0,
+    val udpSelectorLanes: Int = 0,
+    val tcpPooledBufferBytes: Int = 0,
+    val tcpHalfClosedConnections: Int = 0,
     val subscriptionEnabled: Boolean = false,
     val subscriptionUrl: String = "--",
     val message: String = "服务未启动",
@@ -135,6 +154,17 @@ class ProxyViewModel(application: Application) : AndroidViewModel(application) {
         return SettingsUpdateResult(true, "主题已更新")
     }
 
+    fun setPerformanceMode(mode: PerformanceMode): SettingsUpdateResult {
+        val current = ProxySettingsStore.load(app)
+        persistSettings(current.copy(performanceMode = mode), applyToService = true)
+        val label = when (mode) {
+            PerformanceMode.BALANCED -> "均衡"
+            PerformanceMode.TURBO -> "极速"
+            PerformanceMode.POWER_SAVE -> "省电"
+        }
+        return SettingsUpdateResult(true, "正在切换到${label}模式")
+    }
+
     fun resetSettings(): SettingsUpdateResult {
         val running = ProxyStatus.load(app).running
         ProxySettingsStore.save(app, ProxySettings())
@@ -184,6 +214,25 @@ class ProxyViewModel(application: Application) : AndroidViewModel(application) {
             rejectedConnections = stats.rejectedConnections,
             uploadBytes = stats.uploadBytes,
             downloadBytes = stats.downloadBytes,
+            peakConnections = stats.peakConnections,
+            activeClients = stats.activeClients,
+            largestClientConnections = stats.largestClientConnections,
+            maxSessions = stats.maxSessions,
+            maxUdpAssociations = stats.maxUdpAssociations,
+            dnsCacheHits = stats.dnsCacheHits,
+            dnsCacheMisses = stats.dnsCacheMisses,
+            dnsCoalesced = stats.dnsCoalesced,
+            dnsCacheEntries = stats.dnsCacheEntries,
+            connectP50Ms = stats.connectP50Ms,
+            connectP95Ms = stats.connectP95Ms,
+            uploadBytesPerSecond = stats.uploadBytesPerSecond,
+            downloadBytesPerSecond = stats.downloadBytesPerSecond,
+            udpDropped = stats.udpDropped,
+            fairnessReclaims = stats.fairnessReclaims,
+            tcpSelectorLanes = stats.tcpSelectorLanes,
+            udpSelectorLanes = stats.udpSelectorLanes,
+            tcpPooledBufferBytes = stats.tcpPooledBufferBytes,
+            tcpHalfClosedConnections = stats.tcpHalfClosedConnections,
             subscriptionEnabled = status.subscriptionEnabled,
             subscriptionUrl = status.subscriptionUrl,
             message = status.message,

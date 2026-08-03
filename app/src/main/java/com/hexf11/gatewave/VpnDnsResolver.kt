@@ -11,6 +11,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Small VPN-scoped DNS cache with single-flight lookup coalescing.
@@ -28,16 +29,24 @@ internal class VpnDnsResolver : Closeable {
         val error: Throwable? = null,
     )
 
+    data class Stats(val hits: Long, val misses: Long, val coalesced: Long, val cacheEntries: Int)
+
     private data class Key(val networkHandle: Long, val host: String)
+    private data class AddressKey(val networkHandle: Long, val address: String)
     private data class CacheEntry(val result: Result, val expiresAtNanos: Long)
+    private data class AddressHealth(var failures: Int, var lastFailureNanos: Long)
 
     private val closed = AtomicBoolean(false)
+    private val cacheHits = AtomicLong()
+    private val cacheMisses = AtomicLong()
+    private val coalescedLookups = AtomicLong()
     private val lock = Any()
     private val cache = object : LinkedHashMap<Key, CacheEntry>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Key, CacheEntry>?): Boolean =
             size > MAX_CACHE_ENTRIES
     }
     private val inFlight = HashMap<Key, MutableList<Callback>>()
+    private val addressHealth = HashMap<AddressKey, AddressHealth>()
     private val executor: ExecutorService = Executors.newFixedThreadPool(
         DNS_WORKERS,
     ) { runnable ->
@@ -77,14 +86,17 @@ internal class VpnDnsResolver : Closeable {
             val entry = cache[key]
             if (entry != null && entry.expiresAtNanos > now) {
                 cached = entry.result
+                cacheHits.incrementAndGet()
             } else {
                 if (entry != null) cache.remove(key)
                 val waiters = inFlight[key]
                 if (waiters != null) {
                     waiters += callback
+                    coalescedLookups.incrementAndGet()
                 } else {
                     inFlight[key] = mutableListOf(callback)
                     startLookup = true
+                    cacheMisses.incrementAndGet()
                 }
             }
         }
@@ -121,7 +133,69 @@ internal class VpnDnsResolver : Closeable {
     }
 
     fun clear() {
-        synchronized(lock) { cache.clear() }
+        synchronized(lock) {
+            cache.clear()
+            addressHealth.clear()
+        }
+    }
+
+    fun stats(): Stats = synchronized(lock) {
+        Stats(cacheHits.get(), cacheMisses.get(), coalescedLookups.get(), cache.size)
+    }
+
+    fun orderedAddresses(network: Network, addresses: List<InetAddress>): List<InetAddress> =
+        orderedAddresses(network.networkHandle, addresses)
+
+    internal fun orderedAddressesForTest(
+        networkHandle: Long,
+        addresses: List<InetAddress>,
+    ): List<InetAddress> = orderedAddresses(networkHandle, addresses)
+
+    private fun orderedAddresses(networkHandle: Long, addresses: List<InetAddress>): List<InetAddress> =
+        synchronized(lock) {
+            addresses.withIndex()
+                .groupBy { indexed ->
+                    addressHealth[AddressKey(networkHandle, indexed.value.hostAddress.orEmpty())]
+                        ?.failures ?: 0
+                }
+                .toSortedMap()
+                .values
+                .flatMap { tier -> HappyEyeballsOrder.interleave(tier.map { it.value }) }
+        }
+
+    fun recordConnectSuccess(network: Network, address: InetAddress) {
+        recordConnectSuccess(network.networkHandle, address)
+    }
+
+    internal fun recordConnectSuccessForTest(networkHandle: Long, address: InetAddress) {
+        recordConnectSuccess(networkHandle, address)
+    }
+
+    private fun recordConnectSuccess(networkHandle: Long, address: InetAddress) {
+        synchronized(lock) {
+            addressHealth.remove(AddressKey(networkHandle, address.hostAddress.orEmpty()))
+        }
+    }
+
+    fun recordConnectFailure(network: Network, address: InetAddress) {
+        recordConnectFailure(network.networkHandle, address)
+    }
+
+    internal fun recordConnectFailureForTest(networkHandle: Long, address: InetAddress) {
+        recordConnectFailure(networkHandle, address)
+    }
+
+    private fun recordConnectFailure(networkHandle: Long, address: InetAddress) {
+        synchronized(lock) {
+            val key = AddressKey(networkHandle, address.hostAddress.orEmpty())
+            val health = addressHealth.getOrPut(key) { AddressHealth(0, 0) }
+            health.failures = (health.failures + 1).coerceAtMost(MAX_FAILURE_SCORE)
+            health.lastFailureNanos = System.nanoTime()
+            if (addressHealth.size > MAX_ADDRESS_HEALTH_ENTRIES) {
+                addressHealth.entries.minByOrNull { it.value.lastFailureNanos }
+                    ?.let { addressHealth.remove(it.key) }
+            }
+        }
     }
 
     private fun complete(key: Key, result: Result) {
@@ -142,6 +216,7 @@ internal class VpnDnsResolver : Closeable {
         val callbacks: List<Callback>
         synchronized(lock) {
             cache.clear()
+            addressHealth.clear()
             callbacks = inFlight.values.flatten()
             inFlight.clear()
         }
@@ -172,6 +247,8 @@ internal class VpnDnsResolver : Closeable {
         private const val TAG = "GatewaveDns"
         private const val MAX_CACHE_ENTRIES = 512
         private const val DNS_WORKERS = 4
+        private const val MAX_ADDRESS_HEALTH_ENTRIES = 1_024
+        private const val MAX_FAILURE_SCORE = 5
         private const val LOOKUP_TIMEOUT_SECONDS = 10L
         private const val POSITIVE_TTL_NANOS = 60_000_000_000L
         private const val NEGATIVE_TTL_NANOS = 5_000_000_000L
