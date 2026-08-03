@@ -3,12 +3,17 @@ package com.hexf11.gatewave
 import android.util.Log
 import java.io.IOException
 import java.net.InetSocketAddress
-import java.net.ServerSocket
+import java.nio.channels.ServerSocketChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.RejectedExecutionHandler
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.Semaphore
+import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -25,7 +30,14 @@ internal class Socks5Server(
     }
 
     private val sessions = ConcurrentHashMap.newKeySet<Socks5Session>()
-    private val executor: ExecutorService = Executors.newCachedThreadPool(namedFactory("proxy-io"))
+    private val acceptExecutor: ExecutorService =
+        Executors.newSingleThreadExecutor(namedFactory("proxy-accept"))
+    private val sessionExecutor: ExecutorService =
+        newSessionExecutor()
+    private val udpExecutor: ExecutorService =
+        Executors.newFixedThreadPool(MAX_UDP_ASSOCIATIONS * 2, namedFactory("proxy-udp"))
+    private val udpSlots = Semaphore(MAX_UDP_ASSOCIATIONS, true)
+    private val tcpRelayPool = TcpRelayPool()
     private val statsExecutor: ScheduledExecutorService =
         Executors.newSingleThreadScheduledExecutor(namedFactory("proxy-stats"))
     private val totalConnections = AtomicLong()
@@ -35,7 +47,7 @@ internal class Socks5Server(
     private val downloadBytes = AtomicLong()
 
     @Volatile
-    private var serverSocket: ServerSocket? = null
+    private var serverChannel: ServerSocketChannel? = null
 
     @Volatile
     private var running = false
@@ -44,12 +56,14 @@ internal class Socks5Server(
     @Throws(IOException::class)
     fun start() {
         if (running) return
-        val socket = ServerSocket()
+        val channel = ServerSocketChannel.open()
+        channel.configureBlocking(true)
+        val socket = channel.socket()
         socket.reuseAddress = true
-        socket.bind(InetSocketAddress("0.0.0.0", port), 64)
-        serverSocket = socket
+        socket.bind(InetSocketAddress("0.0.0.0", port), ACCEPT_BACKLOG)
+        serverChannel = channel
         running = true
-        executor.execute(::acceptLoop)
+        acceptExecutor.execute(::acceptLoop)
         statsExecutor.scheduleWithFixedDelay(::publishStats, 0, 1, TimeUnit.SECONDS)
         Log.i(TAG, "Listening on 0.0.0.0:$port")
     }
@@ -57,7 +71,8 @@ internal class Socks5Server(
     private fun acceptLoop() {
         while (running) {
             try {
-                val client = serverSocket?.accept() ?: return
+                val clientChannel = serverChannel?.accept() ?: return
+                val client = clientChannel.socket()
                 if (!NetworkUtils.isAllowedClient(client.inetAddress)) {
                     Log.w(TAG, "Rejected non-LAN client ${client.inetAddress}")
                     rejectedConnections.incrementAndGet()
@@ -75,11 +90,19 @@ internal class Socks5Server(
                     udpEnabled = udpEnabled,
                     networkProvider = networkProvider,
                     listener = this,
-                    relayExecutor = executor,
+                    tcpRelayPool = tcpRelayPool,
+                    udpExecutor = udpExecutor,
+                    udpSlots = udpSlots,
                 )
                 sessions.add(session)
                 totalConnections.incrementAndGet()
-                executor.execute(session)
+                try {
+                    sessionExecutor.execute(session)
+                } catch (_: RejectedExecutionException) {
+                    sessions.remove(session)
+                    rejectedConnections.incrementAndGet()
+                    session.close()
+                }
             } catch (error: IOException) {
                 if (running) {
                     Log.e(TAG, "Accept failed", error)
@@ -125,17 +148,51 @@ internal class Socks5Server(
     @Synchronized
     fun stop() {
         running = false
-        val socket = serverSocket
-        serverSocket = null
-        runCatching { socket?.close() }
+        val channel = serverChannel
+        serverChannel = null
+        runCatching { channel?.close() }
         closeSessions()
         statsExecutor.shutdownNow()
-        executor.shutdownNow()
+        acceptExecutor.shutdownNow()
+        sessionExecutor.shutdownNow()
+        udpExecutor.shutdownNow()
+        tcpRelayPool.close()
     }
 
     companion object {
         private const val TAG = "GatewaveServer"
         const val MAX_CONCURRENT_SESSIONS = 256
+        const val MAX_UDP_ASSOCIATIONS = 16
+        private const val ACCEPT_BACKLOG = 256
+        private const val CORE_SESSION_WORKERS = 8
+        private const val MAX_SESSION_WORKERS = 128
+        private const val SESSION_KEEP_ALIVE_SECONDS = 30L
+
+        private fun newSessionExecutor(): ThreadPoolExecutor = ThreadPoolExecutor(
+            CORE_SESSION_WORKERS,
+            MAX_SESSION_WORKERS,
+            SESSION_KEEP_ALIVE_SECONDS,
+            TimeUnit.SECONDS,
+            SynchronousQueue(),
+            namedFactory("proxy-session"),
+            BlockingRejectionHandler(),
+        ).apply {
+            allowCoreThreadTimeOut(true)
+        }
+
+        private class BlockingRejectionHandler : RejectedExecutionHandler {
+            override fun rejectedExecution(task: Runnable, executor: ThreadPoolExecutor) {
+                while (!executor.isShutdown) {
+                    try {
+                        if (executor.queue.offer(task, 100, TimeUnit.MILLISECONDS)) return
+                    } catch (error: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        throw RejectedExecutionException("Interrupted while throttling accepts", error)
+                    }
+                }
+                throw RejectedExecutionException("Session executor is closed")
+            }
+        }
 
         private fun namedFactory(prefix: String): ThreadFactory {
             val index = AtomicInteger()

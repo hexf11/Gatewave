@@ -403,7 +403,7 @@ internal object NetworkDiagnostics {
     private const val SOCKET_TIMEOUT_MS = 7_000
     private const val UDP_TIMEOUT_MS = 8_000
     private const val MAX_HTTP_BYTES = 128 * 1024
-    private const val APP_VERSION = "0.1.0"
+    private const val APP_VERSION = "0.1.1"
     private const val DNS_QUERY_ID = 0x5058
     private const val DNS_SERVER = "8.8.4.4"
     private const val EXIT_IP_URL = "https://api.ipify.org"

@@ -5,19 +5,16 @@ import android.util.Log
 import java.io.DataInputStream
 import java.io.EOFException
 import java.io.IOException
-import java.io.InputStream
 import java.io.OutputStream
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.net.SocketException
-import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.CountDownLatch
+import java.nio.channels.SocketChannel
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal class Socks5Session(
@@ -25,7 +22,9 @@ internal class Socks5Session(
     private val udpEnabled: Boolean,
     private val networkProvider: NetworkProvider,
     private val listener: Listener,
-    private val relayExecutor: ExecutorService,
+    private val tcpRelayPool: TcpRelayPool,
+    private val udpExecutor: ExecutorService,
+    private val udpSlots: Semaphore,
 ) : Runnable {
     enum class Type { NEGOTIATING, TCP, UDP }
 
@@ -39,6 +38,9 @@ internal class Socks5Session(
     }
 
     private val closed = AtomicBoolean(false)
+    private val completionNotified = AtomicBoolean(false)
+    private val tcpHandedOff = AtomicBoolean(false)
+    private val udpSlotHeld = AtomicBoolean(false)
 
     @Volatile
     private var upstream: Socket? = null
@@ -57,9 +59,6 @@ internal class Socks5Session(
 
     @Volatile
     private var type = Type.NEGOTIATING
-
-    @Volatile
-    private var lastTcpActivityNanos = System.nanoTime()
 
     override fun run() {
         try {
@@ -110,8 +109,7 @@ internal class Socks5Session(
                 runCatching { sendReply(client.getOutputStream(), 0x01, null) }
             }
         } finally {
-            close()
-            listener.onClosed(this)
+            if (!tcpHandedOff.get()) complete()
         }
     }
 
@@ -162,7 +160,7 @@ internal class Socks5Session(
         return Request(command, host, port)
     }
 
-    @Throws(IOException::class, InterruptedException::class)
+    @Throws(IOException::class)
     private fun handleConnect(vpn: Network, request: Request, output: OutputStream) {
         val selected = vpn.getAllByName(request.host)
             .firstOrNull { !NetworkUtils.isBlockedTarget(it) }
@@ -172,14 +170,15 @@ internal class Socks5Session(
             throw IOException("Destination rejected by local-network guard")
         }
 
-        val remote = vpn.socketFactory.createSocket()
+        val clientChannel = client.channel
+            ?: throw IOException("Accepted client has no SocketChannel")
+        val remoteChannel = SocketChannel.open()
+        val remote = remoteChannel.socket()
         upstream = remote
+        vpn.bindSocket(remote)
         remote.tcpNoDelay = true
         remote.keepAlive = true
         remote.connect(InetSocketAddress(selected, request.port), CONNECT_TIMEOUT_MS)
-        lastTcpActivityNanos = System.nanoTime()
-        client.soTimeout = TCP_IDLE_POLL_MS
-        remote.soTimeout = TCP_IDLE_POLL_MS
         sendReply(output, 0x00, remote.localSocketAddress as InetSocketAddress)
         terminalReplySent = true
 
@@ -188,7 +187,21 @@ internal class Socks5Session(
             "CONNECT ${request.host}:${request.port} via network=$vpn " +
                 "local=${remote.localAddress.hostAddress}",
         )
-        relayBidirectionally(remote)
+        tcpHandedOff.set(true)
+        try {
+            tcpRelayPool.register(
+                client = clientChannel,
+                remote = remoteChannel,
+                trafficListener = TcpRelayPool.TrafficListener(listener::onTraffic),
+                closeListener = TcpRelayPool.CloseListener { relayFailed ->
+                    if (relayFailed && !closed.get()) failed = true
+                    complete()
+                },
+            )
+        } catch (error: Exception) {
+            tcpHandedOff.set(false)
+            throw error
+        }
     }
 
     @Throws(IOException::class)
@@ -198,12 +211,18 @@ internal class Socks5Session(
         controlInput: DataInputStream,
         controlOutput: OutputStream,
     ) {
+        if (!udpSlots.tryAcquire()) {
+            sendReply(controlOutput, 0x01, null)
+            terminalReplySent = true
+            throw IOException("UDP association limit reached")
+        }
+        udpSlotHeld.set(true)
         val relay = UdpRelay(
             vpn,
             client.localAddress,
             client.inetAddress,
             request.port,
-            relayExecutor,
+            udpExecutor,
             UdpRelay.Listener { _, relayFailed ->
                 if (relayFailed) failed = true
                 close()
@@ -222,57 +241,6 @@ internal class Socks5Session(
         }
     }
 
-    @Throws(InterruptedException::class)
-    private fun relayBidirectionally(remote: Socket) {
-        val finished = CountDownLatch(2)
-        relayExecutor.execute { copy(client, remote, finished, true) }
-        // Reuse the session worker for the second direction.
-        copy(remote, client, finished, false)
-        finished.await(2, TimeUnit.SECONDS)
-    }
-
-    private fun copy(
-        source: Socket,
-        destination: Socket,
-        finished: CountDownLatch,
-        uploadDirection: Boolean,
-    ) {
-        val buffer = ByteArray(32 * 1024)
-        try {
-            val input: InputStream = source.getInputStream()
-            val output: OutputStream = destination.getOutputStream()
-            while (!closed.get()) {
-                val count = try {
-                    input.read(buffer)
-                } catch (_: SocketTimeoutException) {
-                    if (isTcpIdle()) {
-                        Log.i(TAG, "Closed idle TCP relay after ${TCP_IDLE_TIMEOUT_MS}ms")
-                        break
-                    }
-                    continue
-                }
-                if (count < 0) break
-                if (count > 0) {
-                    output.write(buffer, 0, count)
-                    output.flush()
-                    lastTcpActivityNanos = System.nanoTime()
-                    listener.onTraffic(
-                        if (uploadDirection) count.toLong() else 0,
-                        if (uploadDirection) 0 else count.toLong(),
-                    )
-                }
-            }
-            runCatching { destination.shutdownOutput() }
-        } catch (_: SocketException) {
-            // Closing either side terminates the relay.
-        } catch (error: IOException) {
-            Log.d(TAG, "Relay ended: ${error.message}")
-        } finally {
-            finished.countDown()
-            close()
-        }
-    }
-
     fun close() {
         if (!closed.compareAndSet(false, true)) return
         udpRelay?.close()
@@ -280,12 +248,15 @@ internal class Socks5Session(
         closeQuietly(client)
     }
 
+    private fun complete() {
+        close()
+        if (udpSlotHeld.compareAndSet(true, false)) udpSlots.release()
+        if (completionNotified.compareAndSet(false, true)) listener.onClosed(this)
+    }
+
     fun type(): Type = type
 
     fun failed(): Boolean = failed
-
-    private fun isTcpIdle(): Boolean =
-        System.nanoTime() - lastTcpActivityNanos >= TCP_IDLE_TIMEOUT_MS * 1_000_000L
 
     private data class Request(val command: Int, val host: String, val port: Int)
 
@@ -294,7 +265,6 @@ internal class Socks5Session(
         const val HANDSHAKE_TIMEOUT_MS = 15_000
         const val CONNECT_TIMEOUT_MS = 10_000
         const val TCP_IDLE_TIMEOUT_MS = 180_000
-        private const val TCP_IDLE_POLL_MS = 30_000
 
         @Throws(IOException::class)
         private fun sendReply(output: OutputStream, reply: Int, bound: InetSocketAddress?) {
