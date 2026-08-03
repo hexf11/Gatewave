@@ -732,6 +732,18 @@ private fun LogsScreen(state: ProxyUiState, contentPadding: PaddingValues) {
                 "直接缓冲复用",
                 "命中 ${state.tcpBufferPoolHits} · 分配 ${state.tcpDirectBufferAllocations}",
             )
+            CounterRow(
+                "TCP 交互优先",
+                "${formatBytes(state.tcpInteractiveWriteBytes)} · 公平让出 ${state.tcpFairnessDeferredReads}",
+            )
+            CounterRow(
+                "TCP 排队延迟",
+                "P50 ${formatMicros(state.tcpQueueDelayP50Us)} · P95 ${formatMicros(state.tcpQueueDelayP95Us)}",
+            )
+            CounterRow(
+                "TCP 重调度",
+                "P50 ${formatMicros(state.tcpRescheduleDelayP50Us)} · P95 ${formatMicros(state.tcpRescheduleDelayP95Us)}",
+            )
             CounterRow("TCP 半关闭排空", state.tcpHalfClosedConnections.toString())
             CounterRow("实时上传", "${formatBytes(state.uploadBytesPerSecond)}/s")
             CounterRow("实时下载", "${formatBytes(state.downloadBytesPerSecond)}/s")
@@ -1505,4 +1517,9 @@ private fun formatBytes(bytes: Long): String = when {
     bytes < 1024L * 1024 -> "%.1f KiB".format(bytes / 1024.0)
     bytes < 1024L * 1024 * 1024 -> "%.1f MiB".format(bytes / (1024.0 * 1024.0))
     else -> "%.2f GiB".format(bytes / (1024.0 * 1024.0 * 1024.0))
+}
+
+private fun formatMicros(microseconds: Long): String = when {
+    microseconds < 1_000 -> "$microseconds µs"
+    else -> "%.1f ms".format(microseconds / 1_000.0)
 }

@@ -389,6 +389,7 @@ internal class Socks5Session(
             tcpRelayPool.register(
                 client = client,
                 remote = remote,
+                clientAddress = clientIp,
                 initialClientData = prefetchedClientData,
                 trafficListener = TcpRelayPool.TrafficListener(listener::onTraffic),
                 closeListener = TcpRelayPool.CloseListener { relayFailed ->

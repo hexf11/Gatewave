@@ -451,7 +451,10 @@ internal object NetworkDiagnostics {
             "调优: TCP 上游窗口 ${stats.tcpReceiveBufferBytes} bytes · " +
                 "直写 ${stats.tcpEagerWriteBytes} bytes · 背压 ${stats.tcpPartialWriteEvents} · " +
                 "让出 ${stats.tcpReadyBudgetYields} · 缓冲复用 ${stats.tcpBufferPoolHits} / " +
-                "分配 ${stats.tcpDirectBufferAllocations} · " +
+                "分配 ${stats.tcpDirectBufferAllocations} · 交互 ${stats.tcpInteractiveWriteBytes} bytes · " +
+                "公平让出 ${stats.tcpFairnessDeferredReads} · " +
+                "排队 P50/P95 ${stats.tcpQueueDelayP50Us}/${stats.tcpQueueDelayP95Us} us · " +
+                "重调度 P50/P95 ${stats.tcpRescheduleDelayP50Us}/${stats.tcpRescheduleDelayP95Us} us · " +
                 "UDP 快路径 ${stats.udpFastPathHits} · 解析 ${stats.udpResolutionMisses} · " +
                 "队列峰值 ${stats.udpMaxQueueDepth}",
         )

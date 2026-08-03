@@ -72,6 +72,12 @@ internal data class ProxyStatus(
                 putLong("tcpReadyBudgetYields", stats.tcpReadyBudgetYields)
                 putLong("tcpBufferPoolHits", stats.tcpBufferPoolHits)
                 putLong("tcpDirectBufferAllocations", stats.tcpDirectBufferAllocations)
+                putLong("tcpInteractiveWriteBytes", stats.tcpInteractiveWriteBytes)
+                putLong("tcpFairnessDeferredReads", stats.tcpFairnessDeferredReads)
+                putLong("tcpQueueDelayP50Us", stats.tcpQueueDelayP50Us)
+                putLong("tcpQueueDelayP95Us", stats.tcpQueueDelayP95Us)
+                putLong("tcpRescheduleDelayP50Us", stats.tcpRescheduleDelayP50Us)
+                putLong("tcpRescheduleDelayP95Us", stats.tcpRescheduleDelayP95Us)
                 putLong("udpFastPathHits", stats.udpFastPathHits)
                 putLong("udpResolutionMisses", stats.udpResolutionMisses)
                 putInt("udpMaxQueueDepth", stats.udpMaxQueueDepth)
@@ -144,6 +150,24 @@ internal data class ProxyStatus(
                     tcpBufferPoolHits = preferences.getLong("tcpBufferPoolHits", 0),
                     tcpDirectBufferAllocations = preferences.getLong(
                         "tcpDirectBufferAllocations",
+                        0,
+                    ),
+                    tcpInteractiveWriteBytes = preferences.getLong(
+                        "tcpInteractiveWriteBytes",
+                        0,
+                    ),
+                    tcpFairnessDeferredReads = preferences.getLong(
+                        "tcpFairnessDeferredReads",
+                        0,
+                    ),
+                    tcpQueueDelayP50Us = preferences.getLong("tcpQueueDelayP50Us", 0),
+                    tcpQueueDelayP95Us = preferences.getLong("tcpQueueDelayP95Us", 0),
+                    tcpRescheduleDelayP50Us = preferences.getLong(
+                        "tcpRescheduleDelayP50Us",
+                        0,
+                    ),
+                    tcpRescheduleDelayP95Us = preferences.getLong(
+                        "tcpRescheduleDelayP95Us",
                         0,
                     ),
                     udpFastPathHits = preferences.getLong("udpFastPathHits", 0),

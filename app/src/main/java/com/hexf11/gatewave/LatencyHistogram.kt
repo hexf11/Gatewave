@@ -3,13 +3,13 @@ package com.hexf11.gatewave
 import java.util.concurrent.atomic.AtomicLongArray
 
 internal class LatencyHistogram(
-    private val upperBoundsMs: LongArray = longArrayOf(10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000),
+    private val upperBounds: LongArray = longArrayOf(10, 25, 50, 100, 250, 500, 1_000, 2_000, 5_000, 10_000),
 ) {
-    private val buckets = AtomicLongArray(upperBoundsMs.size + 1)
+    private val buckets = AtomicLongArray(upperBounds.size + 1)
 
-    fun record(milliseconds: Long) {
-        val index = upperBoundsMs.indexOfFirst { milliseconds <= it }
-            .let { if (it < 0) upperBoundsMs.size else it }
+    fun record(value: Long) {
+        val index = upperBounds.indexOfFirst { value <= it }
+            .let { if (it < 0) upperBounds.size else it }
         buckets.incrementAndGet(index)
     }
 
@@ -20,8 +20,8 @@ internal class LatencyHistogram(
         var seen = 0L
         for (index in 0 until buckets.length()) {
             seen += buckets.get(index)
-            if (seen >= target) return upperBoundsMs.getOrElse(index) { upperBoundsMs.last() + 1 }
+            if (seen >= target) return upperBounds.getOrElse(index) { upperBounds.last() + 1 }
         }
-        return upperBoundsMs.last() + 1
+        return upperBounds.last() + 1
     }
 }
