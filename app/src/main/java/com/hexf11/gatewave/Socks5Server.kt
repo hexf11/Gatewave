@@ -7,13 +7,9 @@ import java.nio.channels.ServerSocketChannel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.RejectedExecutionHandler
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.Semaphore
-import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.ThreadFactory
-import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -32,11 +28,11 @@ internal class Socks5Server(
     private val sessions = ConcurrentHashMap.newKeySet<Socks5Session>()
     private val acceptExecutor: ExecutorService =
         Executors.newSingleThreadExecutor(namedFactory("proxy-accept"))
-    private val sessionExecutor: ExecutorService =
-        newSessionExecutor()
     private val udpExecutor: ExecutorService =
         Executors.newFixedThreadPool(MAX_UDP_ASSOCIATIONS * 2, namedFactory("proxy-udp"))
     private val udpSlots = Semaphore(MAX_UDP_ASSOCIATIONS, true)
+    private val dnsResolver = VpnDnsResolver()
+    private val sessionReactor = Socks5SessionReactor()
     private val tcpRelayPool = TcpRelayPool()
     private val statsExecutor: ScheduledExecutorService =
         Executors.newSingleThreadScheduledExecutor(namedFactory("proxy-stats"))
@@ -45,6 +41,9 @@ internal class Socks5Server(
     private val rejectedConnections = AtomicLong()
     private val uploadBytes = AtomicLong()
     private val downloadBytes = AtomicLong()
+    private val activeConnections = AtomicInteger()
+    private val activeTcp = AtomicInteger()
+    private val activeUdp = AtomicInteger()
 
     @Volatile
     private var serverChannel: ServerSocketChannel? = null
@@ -57,10 +56,15 @@ internal class Socks5Server(
     fun start() {
         if (running) return
         val channel = ServerSocketChannel.open()
-        channel.configureBlocking(true)
-        val socket = channel.socket()
-        socket.reuseAddress = true
-        socket.bind(InetSocketAddress("0.0.0.0", port), ACCEPT_BACKLOG)
+        try {
+            channel.configureBlocking(true)
+            val socket = channel.socket()
+            socket.reuseAddress = true
+            socket.bind(InetSocketAddress("0.0.0.0", port), ACCEPT_BACKLOG)
+        } catch (error: Exception) {
+            runCatching { channel.close() }
+            throw error
+        }
         serverChannel = channel
         running = true
         acceptExecutor.execute(::acceptLoop)
@@ -79,27 +83,28 @@ internal class Socks5Server(
                     client.close()
                     continue
                 }
-                if (sessions.size >= MAX_CONCURRENT_SESSIONS) {
+                if (activeConnections.get() >= MAX_CONCURRENT_SESSIONS) {
                     Log.w(TAG, "Rejected client: concurrent session limit $MAX_CONCURRENT_SESSIONS")
                     rejectedConnections.incrementAndGet()
                     client.close()
                     continue
                 }
                 val session = Socks5Session(
-                    client = client,
+                    client = clientChannel,
                     udpEnabled = udpEnabled,
                     networkProvider = networkProvider,
                     listener = this,
                     tcpRelayPool = tcpRelayPool,
+                    dnsResolver = dnsResolver,
                     udpExecutor = udpExecutor,
                     udpSlots = udpSlots,
                 )
                 sessions.add(session)
+                activeConnections.incrementAndGet()
                 totalConnections.incrementAndGet()
                 try {
-                    sessionExecutor.execute(session)
-                } catch (_: RejectedExecutionException) {
-                    sessions.remove(session)
+                    sessionReactor.register(session)
+                } catch (error: Exception) {
                     rejectedConnections.incrementAndGet()
                     session.close()
                 }
@@ -112,8 +117,23 @@ internal class Socks5Server(
         }
     }
 
+    override fun onTypeChanged(session: Socks5Session, type: Socks5Session.Type) {
+        if (!sessions.contains(session)) return
+        when (type) {
+            Socks5Session.Type.TCP -> activeTcp.incrementAndGet()
+            Socks5Session.Type.UDP -> activeUdp.incrementAndGet()
+            Socks5Session.Type.NEGOTIATING -> Unit
+        }
+    }
+
     override fun onClosed(session: Socks5Session) {
-        sessions.remove(session)
+        if (!sessions.remove(session)) return
+        activeConnections.decrementAndGet()
+        when (session.type()) {
+            Socks5Session.Type.TCP -> activeTcp.decrementAndGet()
+            Socks5Session.Type.UDP -> activeUdp.decrementAndGet()
+            Socks5Session.Type.NEGOTIATING -> Unit
+        }
         if (session.failed()) failedConnections.incrementAndGet()
     }
 
@@ -123,19 +143,18 @@ internal class Socks5Server(
     }
 
     fun closeSessions() {
-        sessions.forEach(Socks5Session::close)
-        sessions.clear()
+        sessions.toList().forEach(Socks5Session::close)
         publishStats()
     }
 
+    fun invalidateDnsCache() = dnsResolver.clear()
+
     private fun publishStats() {
-        val tcp = sessions.count { it.type() == Socks5Session.Type.TCP }
-        val udp = sessions.count { it.type() == Socks5Session.Type.UDP }
         listener.onStatsChanged(
             ProxyStats(
-                activeConnections = sessions.size,
-                activeTcp = tcp,
-                activeUdp = udp,
+                activeConnections = activeConnections.get().coerceAtLeast(0),
+                activeTcp = activeTcp.get().coerceAtLeast(0),
+                activeUdp = activeUdp.get().coerceAtLeast(0),
                 totalConnections = totalConnections.get(),
                 failedConnections = failedConnections.get(),
                 rejectedConnections = rejectedConnections.get(),
@@ -154,9 +173,10 @@ internal class Socks5Server(
         closeSessions()
         statsExecutor.shutdownNow()
         acceptExecutor.shutdownNow()
-        sessionExecutor.shutdownNow()
+        sessionReactor.close()
         udpExecutor.shutdownNow()
         tcpRelayPool.close()
+        dnsResolver.close()
     }
 
     companion object {
@@ -164,36 +184,6 @@ internal class Socks5Server(
         const val MAX_CONCURRENT_SESSIONS = 256
         const val MAX_UDP_ASSOCIATIONS = 16
         private const val ACCEPT_BACKLOG = 256
-        private const val CORE_SESSION_WORKERS = 8
-        private const val MAX_SESSION_WORKERS = 128
-        private const val SESSION_KEEP_ALIVE_SECONDS = 30L
-
-        private fun newSessionExecutor(): ThreadPoolExecutor = ThreadPoolExecutor(
-            CORE_SESSION_WORKERS,
-            MAX_SESSION_WORKERS,
-            SESSION_KEEP_ALIVE_SECONDS,
-            TimeUnit.SECONDS,
-            SynchronousQueue(),
-            namedFactory("proxy-session"),
-            BlockingRejectionHandler(),
-        ).apply {
-            allowCoreThreadTimeOut(true)
-        }
-
-        private class BlockingRejectionHandler : RejectedExecutionHandler {
-            override fun rejectedExecution(task: Runnable, executor: ThreadPoolExecutor) {
-                while (!executor.isShutdown) {
-                    try {
-                        if (executor.queue.offer(task, 100, TimeUnit.MILLISECONDS)) return
-                    } catch (error: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        throw RejectedExecutionException("Interrupted while throttling accepts", error)
-                    }
-                }
-                throw RejectedExecutionException("Session executor is closed")
-            }
-        }
-
         private fun namedFactory(prefix: String): ThreadFactory {
             val index = AtomicInteger()
             return ThreadFactory { runnable ->

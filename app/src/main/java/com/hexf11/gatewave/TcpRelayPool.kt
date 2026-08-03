@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * Each connection is assigned to one selector lane instead of keeping two blocking threads alive.
  */
 internal class TcpRelayPool(
-    laneCount: Int = DEFAULT_LANES,
+    laneCount: Int = SelectorLaneSizing.relayLanes(),
 ) : Closeable {
     fun interface CloseListener {
         fun onClosed(failed: Boolean)
@@ -34,6 +34,10 @@ internal class TcpRelayPool(
     private val nextLane = AtomicInteger()
     private val lanes = List(laneCount.coerceAtLeast(1)) { index ->
         RelayLane("proxy-tcp-${index + 1}")
+    }
+
+    init {
+        Log.i(TAG, "Started ${lanes.size} dynamic TCP selector lane(s)")
     }
 
     @Throws(IOException::class)
@@ -58,6 +62,7 @@ internal class TcpRelayPool(
         private val running = AtomicBoolean(true)
         private val pending = ConcurrentLinkedQueue<Registration>()
         private val connections = ConcurrentHashMap.newKeySet<Connection>()
+        private val buffers = DirectBufferPool()
         private val thread = Thread(::runLoop, threadName).apply {
             isDaemon = true
             start()
@@ -113,6 +118,7 @@ internal class TcpRelayPool(
                     registration.remote.configureBlocking(false)
                     val connection = Connection(
                         lane = this,
+                        buffers = buffers,
                         client = registration.client,
                         remote = registration.remote,
                         trafficListener = registration.trafficListener,
@@ -153,14 +159,15 @@ internal class TcpRelayPool(
 
     private class Connection(
         private val lane: RelayLane,
+        private val buffers: DirectBufferPool,
         private val client: SocketChannel,
         private val remote: SocketChannel,
         private val trafficListener: TrafficListener,
         private val closeListener: CloseListener,
     ) {
         private val closed = AtomicBoolean(false)
-        private val upload = ByteBuffer.allocateDirect(BUFFER_SIZE)
-        private val download = ByteBuffer.allocateDirect(BUFFER_SIZE)
+        private var upload: ByteBuffer? = null
+        private var download: ByteBuffer? = null
 
         private lateinit var clientKey: SelectionKey
         private lateinit var remoteKey: SelectionKey
@@ -183,8 +190,7 @@ internal class TcpRelayPool(
                 if (!closed.get() && key.isValid && key.isWritable) write(clientSide)
             } catch (_: CancelledKeyException) {
                 close(failed = false)
-            } catch (error: IOException) {
-                Log.d(TAG, "TCP relay ended: ${error.message}")
+            } catch (_: IOException) {
                 close(failed = true)
             } catch (error: Exception) {
                 Log.w(TAG, "TCP relay failed", error)
@@ -196,13 +202,17 @@ internal class TcpRelayPool(
             val source = if (clientSide) client else remote
             val sourceKey = if (clientSide) clientKey else remoteKey
             val destinationKey = if (clientSide) remoteKey else clientKey
-            val buffer = if (clientSide) upload else download
+            val buffer = bufferForRead(clientSide)
             val count = source.read(buffer)
             if (count < 0) {
+                releaseBuffer(clientSide)
                 close(failed = false)
                 return
             }
-            if (count == 0) return
+            if (count == 0) {
+                releaseBuffer(clientSide)
+                return
+            }
             lastActivityNanos = System.nanoTime()
             buffer.flip()
             removeInterest(sourceKey, SelectionKey.OP_READ)
@@ -214,6 +224,11 @@ internal class TcpRelayPool(
             val destinationKey = if (clientSide) clientKey else remoteKey
             val sourceKey = if (clientSide) remoteKey else clientKey
             val buffer = if (clientSide) download else upload
+            if (buffer == null) {
+                removeInterest(destinationKey, SelectionKey.OP_WRITE)
+                addInterest(sourceKey, SelectionKey.OP_READ)
+                return
+            }
             val count = destination.write(buffer)
             if (count > 0) {
                 lastActivityNanos = System.nanoTime()
@@ -223,7 +238,7 @@ internal class TcpRelayPool(
                 )
             }
             if (!buffer.hasRemaining()) {
-                buffer.clear()
+                releaseBuffer(clientSide = !clientSide)
                 removeInterest(destinationKey, SelectionKey.OP_WRITE)
                 addInterest(sourceKey, SelectionKey.OP_READ)
             }
@@ -235,8 +250,29 @@ internal class TcpRelayPool(
             runCatching { remoteKey.cancel() }
             runCatching { client.close() }
             runCatching { remote.close() }
+            upload?.let(buffers::release)
+            download?.let(buffers::release)
+            upload = null
+            download = null
             lane.remove(this)
             closeListener.onClosed(failed)
+        }
+
+        private fun bufferForRead(clientSide: Boolean): ByteBuffer {
+            if (clientSide) {
+                return upload ?: buffers.acquire().also { upload = it }
+            }
+            return download ?: buffers.acquire().also { download = it }
+        }
+
+        private fun releaseBuffer(clientSide: Boolean) {
+            if (clientSide) {
+                upload?.let(buffers::release)
+                upload = null
+            } else {
+                download?.let(buffers::release)
+                download = null
+            }
         }
 
         private fun addInterest(key: SelectionKey, operation: Int) {
@@ -245,6 +281,33 @@ internal class TcpRelayPool(
 
         private fun removeInterest(key: SelectionKey, operation: Int) {
             if (key.isValid) key.interestOps(key.interestOps() and operation.inv())
+        }
+    }
+
+    private class DirectBufferPool {
+        private val available = ConcurrentLinkedQueue<ByteBuffer>()
+        private val pooled = AtomicInteger()
+
+        fun acquire(): ByteBuffer {
+            val buffer = available.poll()
+            if (buffer != null) {
+                pooled.decrementAndGet()
+                buffer.clear()
+                return buffer
+            }
+            return ByteBuffer.allocateDirect(BUFFER_SIZE)
+        }
+
+        fun release(buffer: ByteBuffer) {
+            buffer.clear()
+            while (true) {
+                val count = pooled.get()
+                if (count >= MAX_POOLED_BUFFERS_PER_LANE) return
+                if (pooled.compareAndSet(count, count + 1)) {
+                    available.add(buffer)
+                    return
+                }
+            }
         }
     }
 
@@ -268,8 +331,8 @@ internal class TcpRelayPool(
 
     companion object {
         private const val TAG = "GatewaveTcpRelay"
-        private const val DEFAULT_LANES = 2
         private const val BUFFER_SIZE = 32 * 1024
+        private const val MAX_POOLED_BUFFERS_PER_LANE = 32
         private const val SELECT_TIMEOUT_MS = 1_000L
         private const val IDLE_TIMEOUT_NANOS =
             Socks5Session.TCP_IDLE_TIMEOUT_MS * 1_000_000L

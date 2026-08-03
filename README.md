@@ -30,7 +30,11 @@ Gatewave 是一个运行在 Android 手机上的局域网 SOCKS5 网关。它接
 ## 主要功能
 
 - SOCKS5 `CONNECT` 与 `UDP ASSOCIATE`。
-- TCP 转发使用共享 NIO Selector，浏览器大量长连接不会为每个方向常驻线程。
+- SOCKS5 握手、上游建连和 TCP 转发均使用共享 NIO Selector，不再按连接常驻线程。
+- Selector 数量会根据处理器核心数在合理范围内动态调整。
+- VPN DNS 使用 60 秒短缓存并合并同域名并发查询，VPN 切换时立即失效。
+- TCP DirectBuffer 按需分配并在 Selector lane 内复用，空闲连接不预留转发缓冲区。
+- 状态计数为常数时间，并对磁盘持久化和通知栏刷新做了节流。
 - 上游 TCP、UDP 和域名解析全部绑定系统 VPN。
 - VPN 中断时关闭现有会话并暂停转发。
 - 只接受回环地址和当前私有局域网中的客户端。

@@ -29,6 +29,9 @@ internal class ProxyService : Service(), Socks5Server.Listener {
     private var vpnInterface = "--"
 
     @Volatile
+    private var lanIp = "0.0.0.0"
+
+    @Volatile
     private var stats = ProxyStats.empty()
 
     @Volatile
@@ -43,6 +46,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
     private var server: Socks5Server? = null
     private var subscriptionServer: SubscriptionServer? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var lastNotificationState: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -51,6 +55,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         createNotificationChannel()
         registerNetworkMonitor()
+        refreshLanAddress()
         refreshVpnNetwork()
     }
 
@@ -104,7 +109,12 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             networkProvider = Socks5Session.NetworkProvider { vpnNetwork },
             listener = this,
         )
-        candidate.start()
+        try {
+            candidate.start()
+        } catch (error: Exception) {
+            candidate.stop()
+            throw error
+        }
         server = candidate
         stats = ProxyStats.empty()
         started = true
@@ -192,6 +202,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             override fun onLost(network: Network) {
                 if (network == vpnNetwork) {
                     Log.w(TAG, "VPN lost: $network; closing active sessions")
+                    server?.invalidateDnsCache()
                     vpnNetwork = null
                     vpnInterface = "--"
                     if (!settings.autoResumeVpn) setVpnResumeBlocked(true)
@@ -216,6 +227,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
 
     @Synchronized
     private fun refreshVpnNetwork() {
+        refreshLanAddress()
         val active = connectivityManager.activeNetwork
         val capabilities = active?.let(connectivityManager::getNetworkCapabilities)
         val ready = capabilities != null &&
@@ -227,6 +239,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             vpnNetwork = null
             vpnInterface = "--"
             if (previous != null) {
+                server?.invalidateDnsCache()
                 if (!settings.autoResumeVpn) setVpnResumeBlocked(true)
                 Log.w(TAG, "VPN unavailable: $previous; closing active sessions")
                 server?.closeSessions()
@@ -251,6 +264,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         val previous = vpnNetwork
         if (previous != null && previous != active) {
             Log.i(TAG, "VPN switching $previous -> $active; closing active sessions")
+            server?.invalidateDnsCache()
             vpnNetwork = null
             server?.closeSessions()
         }
@@ -264,6 +278,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
 
     private fun promoteToForeground() {
         val notification = buildNotification()
+        lastNotificationState = notificationState()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
                 NOTIFICATION_ID,
@@ -305,6 +320,14 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             .build()
     }
 
+    private fun notificationState(): String = listOf(
+        settings.socksPort,
+        vpnNetwork != null,
+        stats.activeTcp,
+        stats.activeUdp,
+        subscriptionEnabled,
+    ).joinToString("|")
+
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
@@ -338,8 +361,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         ProxySettingsStore.setVpnResumeBlocked(this, blocked)
     }
 
-    private fun publishStatus(message: String) {
-        val lanIp = NetworkUtils.findLanIpv4(this)
+    private fun publishStatus(message: String, persistNow: Boolean = false) {
         val endpoint = "$lanIp:${settings.socksPort}"
         val subscriptionUrl = if (subscriptionEnabled && lanIp != "0.0.0.0") {
             "http://$lanIp:${settings.subscriptionPort}${SubscriptionServer.CONFIG_PATH}"
@@ -355,11 +377,19 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             subscriptionEnabled = subscriptionEnabled,
             subscriptionUrl = subscriptionUrl,
             message = message,
-        ).publish(this)
+        ).publish(this, persistNow)
         if (started) {
-            getSystemService(NotificationManager::class.java)
-                .notify(NOTIFICATION_ID, buildNotification())
+            val notificationState = notificationState()
+            if (notificationState != lastNotificationState) {
+                lastNotificationState = notificationState
+                getSystemService(NotificationManager::class.java)
+                    .notify(NOTIFICATION_ID, buildNotification())
+            }
         }
+    }
+
+    private fun refreshLanAddress() {
+        lanIp = NetworkUtils.findLanIpv4(this)
     }
 
     override fun onStatsChanged(stats: ProxyStats) {
@@ -379,7 +409,7 @@ internal class ProxyService : Service(), Socks5Server.Listener {
             port = settings.subscriptionPort,
             configProvider = SubscriptionServer.ConfigProvider {
                 ClashConfigGenerator.generate(
-                    serverAddress = NetworkUtils.findLanIpv4(this),
+                    serverAddress = lanIp,
                     socksPort = settings.socksPort,
                     udpEnabled = settings.udpEnabled,
                 )
@@ -424,13 +454,13 @@ internal class ProxyService : Service(), Socks5Server.Listener {
         ProxyStatus(
             running = false,
             vpnReady = false,
-            endpoint = "${NetworkUtils.findLanIpv4(this)}:${settings.socksPort}",
+            endpoint = "$lanIp:${settings.socksPort}",
             vpnInterface = "--",
             stats = ProxyStats.empty(),
             subscriptionEnabled = false,
             subscriptionUrl = "--",
             message = "服务已停止",
-        ).publish(this)
+        ).publish(this, persistNow = true)
         super.onDestroy()
     }
 

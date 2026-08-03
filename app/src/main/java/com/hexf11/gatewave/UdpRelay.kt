@@ -23,6 +23,7 @@ internal class UdpRelay @Throws(IOException::class) constructor(
     private val expectedClientAddress: InetAddress,
     requestedClientPort: Int,
     private val executor: ExecutorService,
+    private val dnsResolver: VpnDnsResolver,
     private val listener: Listener,
     private val trafficListener: TrafficListener,
 ) {
@@ -192,7 +193,8 @@ internal class UdpRelay @Throws(IOException::class) constructor(
 
     @Throws(IOException::class)
     private fun resolvePublicAddress(host: String): InetAddress? =
-        vpnNetwork.getAllByName(host).firstOrNull { !NetworkUtils.isBlockedTarget(it) }
+        dnsResolver.resolveBlocking(vpnNetwork, host).addresses
+            .firstOrNull { !NetworkUtils.isBlockedTarget(it) }
 
     private fun fatal(message: String) {
         Log.e(TAG, message)
