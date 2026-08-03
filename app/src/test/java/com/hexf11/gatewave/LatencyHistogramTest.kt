@@ -12,4 +12,13 @@ class LatencyHistogramTest {
         assertEquals(50, histogram.percentile(0.5))
         assertEquals(101, histogram.percentile(0.95))
     }
+
+    @Test
+    fun `采样直方图只写首个和固定间隔样本`() {
+        val histogram = SampledLatencyHistogram(longArrayOf(10, 50, 100), sampleEvery = 4)
+        listOf(5L, 200L, 200L, 200L, 40L).forEach(histogram::record)
+
+        assertEquals(10, histogram.percentile(0.5))
+        assertEquals(50, histogram.percentile(0.95))
+    }
 }

@@ -78,13 +78,14 @@ internal class TcpRelayRoundScheduler<K> {
         if (requestedBytes <= 0) return 0
         val remaining = classRemaining(trafficClass)
         if (remaining <= 0) return 0
-        val byClient = usedByClient(trafficClass)
-        val clientRemaining = if (activeClients <= 1) {
-            remaining
-        } else {
-            val share = divideRoundUp(classInitial(trafficClass), activeClients)
-            (share - (byClient[client] ?: 0)).coerceAtLeast(0)
+        if (activeClients <= 1) {
+            return minOf(requestedBytes, remaining).also {
+                setClassRemaining(trafficClass, remaining - it)
+            }
         }
+        val byClient = usedByClient(trafficClass)
+        val share = divideRoundUp(classInitial(trafficClass), activeClients)
+        val clientRemaining = (share - (byClient[client] ?: 0)).coerceAtLeast(0)
         val granted = minOf(requestedBytes, remaining, clientRemaining)
         if (granted <= 0) return 0
         setClassRemaining(trafficClass, remaining - granted)
@@ -94,6 +95,14 @@ internal class TcpRelayRoundScheduler<K> {
 
     fun refund(client: K, trafficClass: TcpTrafficClass, unusedBytes: Int) {
         if (unusedBytes <= 0) return
+        if (activeClients <= 1) {
+            setClassRemaining(
+                trafficClass,
+                (classRemaining(trafficClass) + unusedBytes)
+                    .coerceAtMost(classInitial(trafficClass)),
+            )
+            return
+        }
         val byClient = usedByClient(trafficClass)
         val used = byClient[client] ?: return
         val refunded = minOf(used, unusedBytes)

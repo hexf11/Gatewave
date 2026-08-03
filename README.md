@@ -38,7 +38,7 @@ Gatewave 是一个运行在 Android 手机上的局域网 SOCKS5 网关。它接
 - 提供均衡、极速、省电三档模式；极速模式启用 8 MiB 上游 TCP 接收窗口与 Wi-Fi 低延迟锁，温度严重时自动降级并回收缓冲池。
 - VPN DNS 使用 60 秒短缓存并合并同域名并发查询，VPN 切换时立即失效。
 - IPv4/IPv6 地址以 250 ms Happy Eyeballs 竞速，失败地址按当前 VPN 网络独立降级。
-- TCP DirectBuffer 按需分配并在 Selector lane 内复用，空闲连接不预留转发缓冲区。
+- TCP DirectBuffer 按需分配并由 Selector lane 单线程复用，空闲连接不预留转发缓冲区；空闲轮、流量计数和观测指标均进行有界批处理。
 - 状态计数为常数时间，并对磁盘持久化和通知栏刷新做了节流。
 - 上游 TCP、UDP 和域名解析全部绑定系统 VPN。
 - VPN 中断时关闭现有会话并暂停转发。

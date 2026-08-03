@@ -25,3 +25,20 @@ internal class LatencyHistogram(
         return upperBounds.last() + 1
     }
 }
+
+/** Reduces atomic histogram writes for selector-lane telemetry while retaining tail visibility. */
+internal class SampledLatencyHistogram(
+    upperBounds: LongArray,
+    private val sampleEvery: Int = 16,
+) {
+    private val histogram = LatencyHistogram(upperBounds)
+    private var recordCount = 0
+
+    fun record(value: Long) {
+        if (recordCount == 0) histogram.record(value)
+        recordCount++
+        if (recordCount >= sampleEvery) recordCount = 0
+    }
+
+    fun percentile(percentile: Double): Long = histogram.percentile(percentile)
+}
